@@ -35,7 +35,7 @@ cd SCX-IMPERATOR && cargo build --release
 
 # Install
 sudo mv target/release/scx_imperator /usr/bin/
-chmod 755 /usr/bin/scx_imperator
+chmod 755 /usr/scx_imperator
 
 # Run (requires root)
 sudo scx_imperator
@@ -250,7 +250,7 @@ The added cost relative to a minimal sched_ext skeleton is approximately 20%, co
 | **Fused Config** | 4 parameters packed into one 64-bit word: `[mult:12][quantum:16][budget:16][starve:20]`. |
 | **Mega-Mailbox** | 64B per-CPU cache-line-isolated state. Carries tier information for waker inheritance with zero false sharing. |
 | **Graduated Backoff** | Confidence system that reduces reclassification frequency once a task's tier has been stable for 3+ stops. |
-| **vtime** | Virtual timestamp used as the DSQ sort key: `(tier << 56) | timestamp`. Encodes both priority and arrival order. |
+| **Vtime** | Virtual timestamp used as the DSQ sort key: `(tier << 56) | timestamp`. Encodes both priority and arrival order. |
 | **Bit-History Register** | 8-bit shift register tracking per-bout overrun outcomes. Demotion triggers when 4 of 8 recent bouts exceeded the tier gate. |
 
 ### Hardware
