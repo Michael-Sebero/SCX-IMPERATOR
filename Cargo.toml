@@ -28,6 +28,12 @@ nix = { version = "0.30", features = ["signal", "poll"] }
 [build-dependencies]
 scx_cargo = { git = "https://github.com/sched-ext/scx", branch = "main", version = "1.0.27" }
 
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
 [[bin]]
 name = "scx_imperator"
 path = "src/main.rs"
