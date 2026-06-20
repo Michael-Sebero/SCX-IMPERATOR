@@ -256,6 +256,25 @@ struct imperator_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
     ctx->overrun_count = 0;
     ctx->lock_skip_count = 0;
 
+    /* C2-Infra + C3: Zero-initialize new telemetry and burst credit fields.
+     *
+     * BPF task-storage zero-initialises new entries, so these writes are
+     * technically redundant — but we make them explicit for three reasons:
+     *   1. Correctness documentation: a reader can confirm the init contract
+     *      without knowing the BPF storage guarantee.
+     *   2. Consistency: every other field in this function is explicitly set.
+     *   3. Future safety: if alloc_task_ctx_cold is ever called outside the
+     *      BPF task-storage create path, the initialisation remains correct.
+     *
+     * enqueue_time = 0: sentinel meaning "no enqueue timestamp yet"; the
+     *   jitter EWMA update in imperator_running skips the update when 0.
+     * jitter_ewma_us = 0: cold start; converges within ~8 context switches.
+     * burst_credit = 0: no accumulated credit at task creation.
+     * __align_pad = 0: explicit zero matches the struct layout comment. */
+    ctx->enqueue_time   = 0;
+    ctx->jitter_ewma_us = 0;
+    ctx->burst_credit   = 0;
+
     /* FIX (C-2): Initialise pending_futex_op to CAKE_FUTEX_OP_UNSET (0xFF).
      *
      * BPF task-storage zero-initialises new entries, giving pending_futex_op
@@ -617,9 +636,117 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     }
 
+    /* C2-Infra: Stamp enqueue_time for dispatch latency measurement.
+     *
+     * Written here — after all early-exit paths (kthread no-tctx, yield) and
+     * after confirming tctx_reg is non-NULL.  Uses now_cached (tunneled from
+     * select_cpu via global_scratch) rather than a fresh scx_bpf_now() call,
+     * which saves one kfunc trampoline (~10-15ns) at the cost of at most one
+     * CPU tick of timestamp error — negligible at the granularity of µs EWMA.
+     *
+     * Truncated to u32: matches last_run_at (also u32 truncation of scx_bpf_now()).
+     * The subtraction (last_run_at - enqueue_time) in imperator_running is always
+     * within the u32 wraparound window (~4.3s) for any real dispatch latency.
+     *
+     * Not stamped on the direct-dispatch paths (kthread, yield, idle, SYNC via
+     * SCX_DSQ_LOCAL_ON) because those tasks never pass through imperator_running
+     * after this point — the stamp would go stale and produce a garbage latency
+     * on the task's next wakeup that does route through here.  The enqueue_time==0
+     * guard in imperator_running skips stale reads. */
+    tctx_reg->enqueue_time = (u32)now_cached;
+
     /* Standard Tier Logic */
     u8 tier = CAKE_TIER_IDX(GET_TIER(tctx_reg));
     u64 slice = tctx_reg->next_slice;
+
+    /* C3: DRR++ Burst Credit — accumulation on preemption.
+     *
+     * When a T1 or T2 task is re-enqueued because it was preempted (not because
+     * it yielded or was woken from sleep), credit it with quantum/4 of burst
+     * credit, up to the per-tier cap.  This credit is consumed in the same
+     * imperator_enqueue call to extend the task's effective slice, reducing the
+     * rescheduling frequency for tasks that are repeatedly preempted mid-quantum
+     * by higher-priority work.
+     *
+     * Per-tier burst caps in kns units (ns >> 10, same as deficit_us):
+     *   quantum_ns = 2,000,000 ns → 1 quantum in kns ≈ 1953.
+     *
+     *   T0:    0 kns — Critical tasks are latency-bound; no burst extension.
+     *   T1: 2000 kns — Compositor/physics: up to ~1×quantum (~2ms) extra.
+     *   T2: 4000 kns — Render threads: up to ~2×quantum (~4ms) extra.
+     *   T3:    0 kns — Bulk tasks are throughput-bound; no burst extension.
+     *
+     * Credit per preemption: quantum_ns >> 12 ≈ 488 kns ≈ 0.5ms.
+     * T2 cap reached after ~8 consecutive preemptions (8 × 488 = 3904 < 4000);
+     * T1 cap reached after ~4 preemptions (4 × 488 = 1952 < 2000; 5th hits cap).
+     *
+     * FIX (audit/Finding-5): Previous cap values were {0, 2, 4, 0} — these are
+     * in kns, giving 2 kns ≈ 2µs and 4 kns ≈ 4µs, ~1000× too small to produce
+     * any meaningful slice extension.  Corrected to {0, 2000, 4000, 0} to match
+     * the "1× and 2× quantum" intent stated in the design documents.
+     *
+     * Lifecycle: credit earned and consumed within the same imperator_enqueue
+     * invocation.  Accumulation block runs first (writes burst_credit), then
+     * consumption block reads and zeroes it.  burst_credit is always 0 after
+     * imperator_enqueue returns — it does not persist between enqueue calls.
+     * Stats: nr_preempt_with_credit counts earning events for TUI/graduation. */
+    static const u16 tier_burst_cap_kns[4] = { 0, 2000, 4000, 0 };
+
+    if ((enq_flags & SCX_ENQ_PREEMPT) && tier <= CAKE_TIER_FRAME) {
+        u16 cap_kns = tier_burst_cap_kns[CAKE_TIER_IDX(tier)];
+        if (cap_kns > 0) {
+            /* Credit = quantum / 4096 kns (÷1024 for ns→kns, ÷4 for quarter).
+             * quantum_ns >> 12 avoids division: for 2ms quantum → ~488 kns ≈ 0.5ms.
+             * Saturating add to cap prevents overflow on repeated preemptions. */
+            u16 add_kns = (u16)(quantum_ns >> 12);
+            u16 cur_kns = tctx_reg->burst_credit;
+            u16 new_kns = (u16)((u32)cur_kns + (u32)add_kns);
+            tctx_reg->burst_credit = (new_kns < cap_kns) ? new_kns : cap_kns;
+
+            if (enable_stats) {
+                struct imperator_stats *s = get_local_stats();
+                if (s) s->nr_preempt_with_credit++;
+            }
+        }
+    }
+
+    /* C3: Burst credit consumption — extend slice before vtime assignment.
+     *
+     * Convert accumulated burst_credit (kns) back to nanoseconds and add to
+     * the current slice.
+     *
+     * Hard ceiling: CAKE_DEFAULT_MULTIPLIER_T2 × quantum_ns >> 10, which equals
+     * the natural T2 quantum (~4ms at Gaming defaults).  This means:
+     *   - A T2 task's slice cannot exceed its natural quantum via burst alone.
+     *   - A T1 task's slice can extend up to the T2 natural quantum (i.e. at
+     *     most double its own natural quantum of ~2ms), which is an acceptable
+     *     ceiling — still well below the T1 starvation threshold (8ms).
+     *   - T0 and T3 tasks never reach this block (burst_credit always 0).
+     *
+     * Using CAKE_DEFAULT_MULTIPLIER_T2 by name prevents silent drift if the
+     * T2 multiplier constant is later changed.
+     *
+     * burst_credit is zeroed before vtime insert so the task re-earns from
+     * zero on its next preemption.  Stats: nr_burst_credit_consumed.
+     *
+     * Ordering: consumption runs BEFORE the IRQ-wake and waker-tier checks
+     * so the extended slice applies even when a tier boost also fires — the
+     * two effects are independent. */
+    u16 bc = tctx_reg->burst_credit;
+    if (bc > 0) {
+        u64 bonus_ns  = (u64)bc << 10;   /* kns → ns */
+        /* Ceiling = T2 natural quantum.  CAKE_DEFAULT_MULTIPLIER_T2 = 2048,
+         * so (quantum_ns * 2048) >> 10 = 2 × quantum_ns = ~4ms at defaults. */
+        u64 max_slice = (quantum_ns * (u64)CAKE_DEFAULT_MULTIPLIER_T2) >> 10;
+        u64 ext_slice = slice + bonus_ns;
+        slice = (ext_slice < max_slice) ? ext_slice : max_slice;
+        tctx_reg->burst_credit = 0;
+
+        if (enable_stats) {
+            struct imperator_stats *s = get_local_stats();
+            if (s) s->nr_burst_credit_consumed++;
+        }
+    }
 
     /* Load packed_info once — shared by all three feature checks below. */
     u32 task_packed = imperator_relaxed_load_u32(&tctx_reg->packed_info);
@@ -1122,6 +1249,53 @@ void BPF_STRUCT_OPS(imperator_running, struct task_struct *p)
         return;
     tctx->last_run_at = (u32)scx_bpf_now();
 
+    /* C2-Infra: Compute and update per-task dispatch latency EWMA.
+     *
+     * Dispatch latency = time from imperator_enqueue to imperator_running.
+     * Measured as (last_run_at - enqueue_time) — both are u32 truncations of
+     * scx_bpf_now(), so the subtraction wraps correctly for any latency < 4.3s.
+     *
+     * Guard: skip when enqueue_time == 0.  Two cases produce a zero stamp:
+     *   (a) Task took the direct-dispatch path (SCX_DSQ_LOCAL_ON via idle or
+     *       SYNC wakeup) — imperator_enqueue did not run, no stamp was written.
+     *   (b) Task was just allocated (alloc_task_ctx_cold) or exec'd/forked —
+     *       field initialized to 0.
+     *   (c) Task previously ran via the DSQ path (stamp was consumed and reset
+     *       to 0 below) and then woke via SYNC — stamp is still 0 from reset.
+     * In all cases 0 means "no valid stamp for this dispatch" and the EWMA must
+     * not be updated.
+     *
+     * FIX (audit/Finding-7): After updating the EWMA, reset enqueue_time to 0.
+     * Without this reset, a task that alternates DSQ→SYNC wakeups would carry
+     * a stale enqueue_time from the DSQ dispatch into the subsequent SYNC
+     * dispatch.  imperator_running would then compute (last_run_at - stale_T1),
+     * measuring seconds rather than microseconds and injecting a 65ms-clamped
+     * outlier into jitter_ewma_us.  At α=1/8 one such outlier inflates the EWMA
+     * by ~8× and takes ~56 subsequent samples to decay.
+     *
+     * Reset follows the CAKE_FLOW_IRQ_WAKE one-shot consume pattern: the field
+     * is zeroed in the same block that uses it, making the lifecycle explicit.
+     *
+     * EWMA: α = 1/8, symmetric (no directional bias unlike avg_runtime_us).
+     *   new = (old × 7 + sample) >> 3
+     * Computed entirely in u32: old_ewma ≤ 65535, lat_us may reach ~4M for a
+     * pathological u32 wrap; the intermediate product fits in u32 (max ~4.65M
+     * < 2^32).  The clamp below is load-bearing for the lat_us > 65535 case —
+     * not just defensive.
+     *
+     * Latency in nanoseconds is shifted right by 10 (÷1024 ≈ ÷1000) to convert
+     * to approximate microseconds, matching the convention used for runtime_us
+     * throughout the scheduler. */
+    if (tctx->enqueue_time != 0) {
+        u32 lat_ns   = tctx->last_run_at - tctx->enqueue_time;
+        u32 lat_us   = lat_ns >> 10;   /* ns → ~µs (÷1024 ≈ ÷1000) */
+        u32 old_ewma = (u32)tctx->jitter_ewma_us;
+        /* α=1/8: max intermediate = 65535*7 + 4194303 = 4653048 < 2^32, no overflow */
+        u32 new_ewma = (old_ewma * 7 + lat_us) >> 3;
+        tctx->jitter_ewma_us = (u16)(new_ewma > 0xFFFF ? 0xFFFF : new_ewma);
+        tctx->enqueue_time   = 0;  /* Consume stamp — prevents stale reads on next wakeup */
+    }
+
     u32 run_cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
     struct mega_mailbox_entry *mbox = &mega_mailbox[run_cpu];
     u8 tier = CAKE_TIER_IDX(GET_TIER(tctx));
@@ -1436,6 +1610,27 @@ void reclassify_task_cold(struct imperator_task_ctx *tctx)
         u64 mult = UNPACK_MULTIPLIER(cfg);
         tctx->next_slice = (quantum_ns * mult) >> 10;
         tctx->reclass_counter = 0;
+
+        /* FIX (audit/Finding-9): Zero burst_credit on demotion.
+         *
+         * burst_credit is accumulated in imperator_enqueue while the task is in
+         * T1 or T2.  If the task is demoted (e.g. T2→T3) before consuming the
+         * credit, the stale credit would be consumed on the next imperator_enqueue
+         * after demotion — extending a now-T3 task's slice by up to the T2 cap
+         * (up to ~4ms with corrected cap values), an amount the T3 task did not
+         * earn at its new tier.
+         *
+         * Clearing on any tier change (not just demotion) is intentional:
+         *   - Demotion (new_tier > old_tier): credit earned at higher tier is
+         *     inappropriate at a lower tier — clear it.
+         *   - Promotion (new_tier < old_tier): credit was earned at a higher-
+         *     numbered (lower-priority) tier.  The promoted task now runs at
+         *     a better tier; giving it stale lower-tier credit is also wrong.
+         *     Clearing lets it start earning fresh credit at the new tier.
+         *
+         * This is a cold-path store (tier changes are infrequent relative to
+         * the hot-path preemption/dispatch cycle).  Cost: ~1 cycle, cold path. */
+        tctx->burst_credit = 0;
     }
 }
 
@@ -1512,6 +1707,23 @@ s32 BPF_STRUCT_OPS(imperator_init_task, struct task_struct *p,
         tctx->reclass_counter = 0;
         tctx->lock_skip_count = 0;
 
+        /* C2-Infra + C3: Reset telemetry and burst credit on exec.
+         *
+         * A freshly exec'd process inherits the old task_struct but starts
+         * a completely new execution profile.  Carrying stale jitter_ewma_us
+         * from a shell into a game binary would seed the EWMA with shell
+         * startup latency, causing misleading dispatch latency readings for
+         * the first ~8 context switches.  burst_credit from the pre-exec
+         * process is meaningless and could give the new process an unearned
+         * slice extension on its first preemption.
+         *
+         * enqueue_time is reset to 0 (sentinel) so the guard in
+         * imperator_running skips the EWMA update until the first real
+         * enqueue_time is stamped by imperator_enqueue. */
+        tctx->enqueue_time   = 0;
+        tctx->jitter_ewma_us = 0;
+        tctx->burst_credit   = 0;
+
         /* Recompute pre-fetched slice for the reset tier */
         u64 cfg  = tier_configs[CAKE_TIER_IDX(init_tier)];
         u64 mult = UNPACK_MULTIPLIER(cfg);
@@ -1551,6 +1763,26 @@ s32 BPF_STRUCT_OPS(imperator_init_task, struct task_struct *p,
     u64 cfg  = tier_configs[CAKE_TIER_IDX(ptier)];
     u64 mult = UNPACK_MULTIPLIER(cfg);
     ctctx->next_slice = (quantum_ns * mult) >> 10;
+
+    /* C2-Infra + C3: Zero-initialize telemetry and burst credit in child.
+     *
+     * A forked child inherits the parent's tier and avg_runtime seed (above)
+     * but must start with clean latency telemetry — the child has not yet been
+     * enqueued, so enqueue_time = 0 (sentinel).  Inheriting the parent's
+     * jitter_ewma_us would seed the EWMA with the parent's scheduling history,
+     * which is typically unrepresentative of the child's first execution bouts.
+     *
+     * burst_credit is not inherited: the parent earned it from its own
+     * preemptions and the credit is CPU-context-specific.  Giving it to the
+     * child could produce an unearned slice extension on the child's first
+     * preemption before it has demonstrated any scheduling behavior.
+     *
+     * alloc_task_ctx_cold already zeros these fields (explicit in that function),
+     * so these stores are technically redundant — they are written here for the
+     * same documentation and future-safety reasons described in alloc_task_ctx_cold. */
+    ctctx->enqueue_time   = 0;
+    ctctx->jitter_ewma_us = 0;
+    ctctx->burst_credit   = 0;
 
     return 0;
 }

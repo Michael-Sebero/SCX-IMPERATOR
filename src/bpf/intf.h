@@ -103,7 +103,10 @@ struct imperator_task_ctx {
      * by alloc_task_ctx_cold; also reset on exec in imperator_init_task.
      * FIELD NAME: kept as `overrun_count` to avoid disrupting external tools;
      *             the type (u8) and offset (byte 22) are unchanged.
-     * NO STRUCT SIZE CHANGE: __pad[39] is unchanged. */
+     * STRUCT SIZE: __pad has been reduced from [39] to [28] to accommodate the
+     *   C2-Infra fields (enqueue_time u32, jitter_ewma_us u16) and C3 field
+     *   (burst_credit u16) plus 3 bytes of explicit alignment padding.  The
+     *   struct remains exactly 64B; the _Static_assert below enforces this. */
     u8 overrun_count;
 
     u8 lock_skip_count;
@@ -121,8 +124,82 @@ struct imperator_task_ctx {
      * on the first sys_exit_futex(ret=0) before any sys_enter_futex is observed.
      * The explicit 0xFF init makes the UNSET guard in imperator_tp_exit_futex safe
      * from the very first syscall. */
-    u8 pending_futex_op;
-    u8 __pad[39];
+    u8 pending_futex_op;  /* byte 24 */
+
+    /* Explicit alignment pad [Bytes 25-27]
+     * enqueue_time is u32 and must be 4-byte aligned.  The three bytes between
+     * pending_futex_op (byte 24) and enqueue_time (byte 28) would be silently
+     * inserted by the compiler as implicit padding; we make them explicit so
+     * the _Static_assert below catches any future layout drift.  These bytes
+     * are unused and must be zero-initialized with the rest of the struct. */
+    u8 __align_pad[3];
+
+    /* C2-Infra: Scheduling latency telemetry [Bytes 28-33]
+     *
+     * enqueue_time: wall-clock timestamp (u32 ns, truncated from u64, wraps
+     *   ~4.3s) written at the start of imperator_enqueue for tasks taking the
+     *   standard wakeup/preempt path.  Read in imperator_running to compute
+     *   dispatch latency as (last_run_at - enqueue_time).  The subtraction is
+     *   safe within u32 for any dispatch latency < 4.3s, which covers all
+     *   realistic cases including runaway starvation.  Value 0 means "not yet
+     *   stamped via the timed path" and the jitter EWMA update is skipped.
+     *   Reset to 0 on exec (imperator_init_task !fork path) and fork.
+     *
+     * jitter_ewma_us: per-task EWMA of dispatch latency in approximate
+     *   microseconds (ns >> 10, same shift as runtime_us throughout the
+     *   codebase).  Uses α=1/8 (symmetric) — scheduling latency variance is
+     *   not directionally asymmetric in the way runtime is, so the asymmetric
+     *   α=1/4 promote / α=1/16 demote used by avg_runtime_us is not appropriate.
+     *   Clamped to u16 max (65ms).  Closes W1: first per-task scheduling
+     *   latency signal in the scheduler.  Reset to 0 on exec and fork.
+     *
+     * C3: DRR++ Burst Credit [Bytes 34-35]
+     *
+     * burst_credit: accumulated preemption-recovery credit in units of
+     *   (quantum_ns >> 10) — the same kns units used by deficit_us.  Credited
+     *   by (quantum_ns >> 12) kns (= quantum/4) each time this task is
+     *   re-enqueued via SCX_ENQ_PREEMPT while in tier T1 or T2, up to the
+     *   per-tier cap in tier_burst_cap_kns[].  T0 cap = T3 cap = 0: neither
+     *   critical tasks nor bulk tasks receive burst credit.
+     *
+     *   The credit is accumulated AND consumed within the same imperator_enqueue
+     *   invocation: the accumulation block runs first (adding to burst_credit),
+     *   then the consumption block reads it, extends the slice, and zeros it.
+     *   burst_credit is always 0 when imperator_enqueue returns — it does not
+     *   persist between enqueue calls.  A task that is preempted N consecutive
+     *   times will extend its slice by min(N × quantum/4, cap) on each
+     *   re-dispatch, providing proportional relief against repeated preemptions.
+     *
+     *   FIX (audit/Finding-4): Previous comment stated "set-on-preemption,
+     *   consumed-on-next-dispatch," which was inaccurate.  The correct lifecycle
+     *   is "accumulated and consumed within the same enqueue call."
+     *
+     *   FIX (audit/Finding-5): Previous cap values were {0, 2, 4, 0} in kns,
+     *   giving only ~2µs and ~4µs maximum bonus — too small to reduce
+     *   rescheduling frequency.  Corrected to {0, 2000, 4000, 0}, giving
+     *   T1: ~2ms max bonus (~1× quantum) and T2: ~4ms max bonus (~2× quantum).
+     *
+     *   FIX (audit/Finding-9): burst_credit is cleared in reclassify_task_cold
+     *   whenever the tier changes, preventing stale credit from a higher/lower
+     *   tier being consumed after the task has been reclassified.
+     *
+     *   Lifecycle: zeroed in alloc_task_ctx_cold, exec path of imperator_init_task,
+     *   fork path of imperator_init_task, and on every tier change in
+     *   reclassify_task_cold.  Always 0 after imperator_enqueue returns.
+     *
+     * Struct layout [Bytes 24-63]:
+     *   [24]     pending_futex_op  (u8)
+     *   [25-27]  __align_pad       (u8[3])   alignment gap before u32
+     *   [28-31]  enqueue_time      (u32)     C2-Infra: enqueue timestamp
+     *   [32-33]  jitter_ewma_us    (u16)     C2-Infra: dispatch latency EWMA
+     *   [34-35]  burst_credit      (u16)     C3: preemption burst credit
+     *   [36-63]  __pad             (u8[28])  reserved, zero-initialized
+     *
+     * Total struct size: 64B — one cache line, _Static_assert enforces this. */
+    u32 enqueue_time;      /* bytes 28-31: C2-Infra enqueue timestamp */
+    u16 jitter_ewma_us;    /* bytes 32-33: C2-Infra dispatch latency EWMA */
+    u16 burst_credit;      /* bytes 34-35: C3 preemption burst credit */
+    u8  __pad[28];         /* bytes 36-63: reserved */
 } __attribute__((aligned(64)));
 
 _Static_assert(sizeof(struct imperator_task_ctx) == 64,
@@ -175,7 +252,19 @@ struct imperator_stats {
     u64 nr_lock_holder_skips;
     u64 nr_irq_wake_boosts;
     u64 nr_waker_tier_boosts;
-    u64 _pad[19];
+    /* C3: Burst credit accounting — informational, for TUI and graduation gate.
+     *
+     * nr_preempt_with_credit: incremented each time SCX_ENQ_PREEMPT credits
+     *   burst_credit to a T1/T2 task.  Tracks how often preemption recovery
+     *   fires, which is the expected mechanism for C3's jitter reduction.
+     *
+     * nr_burst_credit_consumed: incremented each time a task dispatches with
+     *   non-zero burst_credit and extends its slice.  Ratio of consumed/credited
+     *   shows whether earned credit is actually being used (tasks that earn credit
+     *   but are re-preempted before consuming it will show a gap). */
+    u64 nr_preempt_with_credit;
+    u64 nr_burst_credit_consumed;
+    u64 _pad[17];
 } __attribute__((aligned(64)));
 
 /* Defaults (Gaming profile) */
