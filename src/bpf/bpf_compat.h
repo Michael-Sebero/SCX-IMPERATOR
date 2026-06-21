@@ -143,15 +143,6 @@
     #define BIT_SCAN_FORWARD_U32(mask) __builtin_ctz(mask)
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * PREFETCH: Materialize address early to encourage prefetch-like behavior
- * - Forces compiler to compute the address, enabling earlier load scheduling
- * - No "memory" clobber: avoids acting as a compiler barrier that would
- *   flush store buffers and inhibit register caching / ILP / MLP
- * ═══════════════════════════════════════════════════════════════════════════ */
-#define CAKE_PREFETCH(addr) \
-    asm volatile("" : : "r"(addr))
-
 /* rq access — scx_bpf_cpu_rq() is universally available (~10-15ns).
  *
  * scx_bpf_rq_locked() would be ~3-5ns faster (skips RCU + bounds check) but

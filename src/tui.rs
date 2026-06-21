@@ -1207,6 +1207,13 @@ pub fn run_tui(
     let mut app = TuiApp::new(topology);
     let tick_rate = Duration::from_secs(interval_secs);
     let mut last_tick = Instant::now();
+    // W-4 fix: cache the most recently computed rates so sub-tick redraws
+    // (triggered by key events) display the last valid values rather than zeros.
+    let mut cached_rates = StatsRates {
+        starve_per_sec: [0.0; 4],
+        lock_skip_per_sec: 0.0,
+        burst_credit_per_sec: 0.0,
+    };
 
     // Initialize clipboard (may fail on headless systems)
     let mut clipboard = Clipboard::new().ok();
@@ -1224,14 +1231,6 @@ pub fn run_tui(
 
         // Get current stats (aggregate from per-cpu BSS array)
         let stats = aggregate_stats(skel);
-
-        // FIX (gap/tui-rates): Compute per-second rates against the previous
-        // snapshot.  tick_stats() advances the snapshot on every call, so rates
-        // reflect exactly one `interval_secs` window rather than a session total.
-        let rates = app.tick_stats(&stats);
-
-        // Draw UI
-        terminal.draw(|frame| draw_ui(frame, &app, &stats, &rates))?;
 
         // Handle events with timeout
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -1272,8 +1271,31 @@ pub fn run_tui(
             }
         }
 
+        // FIX (W-4 / pre-impl-audit): Only advance the rate snapshot and compute
+        // per-second rates when a full tick window has elapsed.
+        //
+        // Previously tick_stats() was called on every loop iteration, including
+        // iterations triggered by early event::poll() returns (key events arriving
+        // faster than interval_secs). This caused elapsed_secs in tick_stats() to
+        // be measured against the previous loop iteration — potentially milliseconds
+        // — making all per-second rates (starve/s, lock_skip/s, burst_credit/s,
+        // dispatch latency) erratic for as long as fast key input continued.
+        //
+        // Fix: move tick_stats() inside the tick-window guard so it fires at most
+        // once per interval_secs, exactly matching the intended rate-computation
+        // window. Rates are cached in a local Option<StatsRates> so draw_ui still
+        // receives valid rates on every redraw; the previous valid rates are reused
+        // on sub-tick loop iterations that are triggered only by key events.
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
+            // Advance the rate snapshot exactly once per interval_secs window.
+            cached_rates = app.tick_stats(&stats);
+            terminal.draw(|frame| draw_ui(frame, &app, &stats, &cached_rates))?;
+        } else {
+            // Sub-tick redraw (key event arrived before tick window elapsed):
+            // reuse the last valid rates — they remain accurate until the next
+            // tick fires and updates the snapshot.
+            terminal.draw(|frame| draw_ui(frame, &app, &stats, &cached_rates))?;
         }
     }
 

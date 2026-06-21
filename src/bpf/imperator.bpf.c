@@ -1411,7 +1411,7 @@ static const u16 tier_overrun_gate[4] = {
  * at the same tier.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static __attribute__((noinline))
-void reclassify_task_cold(struct imperator_task_ctx *tctx)
+void reclassify_task_cold(struct imperator_task_ctx *tctx, bool runnable)
 {
     u32 packed = imperator_relaxed_load_u32(&tctx->packed_info);
 
@@ -1442,8 +1442,29 @@ void reclassify_task_cold(struct imperator_task_ctx *tctx)
      *   T0 Critical  (<100µs):   ~50µs
      *   T1 Interact  (<2000µs):  ~1050µs
      *   T2 Frame     (<8000µs):  ~5000µs
-     *   T3 Bulk      (≥8000µs):  floor = 8001µs */
-    if (runtime_raw > 500000000U) {
+     *   T3 Bulk      (≥8000µs):  floor = 8001µs
+     *
+     * FIX (W-3 / pre-impl-audit): Gate on `!runnable`.
+     *
+     * `imperator_stopping(p, runnable)` receives a kernel-provided bool that
+     * distinguishes "task blocked/slept" (runnable=false) from "task was still
+     * runnable but descheduled" (runnable=true, e.g. preempted, slice expired,
+     * tick-backoff, lock-holder skip cap).  Previously `runnable` was dropped at
+     * the struct_ops boundary and never reached this function — the heuristic
+     * fired purely on elapsed wall-clock time, making it impossible to distinguish
+     * a genuine 500ms sleep from a task that was continuously runnable but starved
+     * by scheduling pressure for the same duration.
+     *
+     * With `!runnable` gating: the midpoint-pull fires ONLY when the task
+     * genuinely blocked (runnable=false), matching the documented intent.  A
+     * runnable-but-starved task that hasn't executed for 500ms keeps its existing
+     * avg_runtime_us unchanged — the starvation preempt mechanism already handles
+     * its scheduling, and false midpoint-pulls would corrupt its tier history.
+     *
+     * Cost: zero — `runnable` is in registers at the struct_ops call site
+     * per the BPF calling convention; threading it through costs one bool
+     * argument and one additional branch taken only when runtime_raw > 500ms. */
+    if (!runnable && runtime_raw > 500000000U) {
         static const u16 tier_sleep_mid[4] = { 50, 1050, 5000, 8001 };
         u8 s_tier = (packed >> SHIFT_TIER) & MASK_TIER;
         u32 cur_fused = tctx->deficit_avg_fused;
@@ -1872,7 +1893,10 @@ void BPF_STRUCT_OPS(imperator_stopping, struct task_struct *p, bool runnable)
             &tier_cpu_mask[stop_tier & (CAKE_TIER_MAX - 1)],
             ~(1ULL << stop_cpu));
 
-        reclassify_task_cold(tctx);
+        /* FIX (W-3): Pass `runnable` through to reclassify_task_cold so the
+         * 500ms post-sleep recovery heuristic can be correctly gated on
+         * !runnable (genuine block/sleep) vs runnable (preempted/starved). */
+        reclassify_task_cold(tctx, runnable);
     }
 }
 
