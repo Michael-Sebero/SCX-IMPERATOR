@@ -35,7 +35,9 @@ _Static_assert(CAKE_TIER_MAX <= 8,
 
 #define LLC_DSQ_BASE 200
 
-#define CAKE_ETD_CROSS_LLC_THRESHOLD 5
+/* FIX (W13): CAKE_ETD_CROSS_LLC_THRESHOLD removed — defined as 5 but never
+ * referenced in BPF or Rust code.  Zero call sites confirmed by static analysis.
+ * If a cross-LLC cost threshold is needed in future, reintroduce it here. */
 
 /* FLOW STATE FLAGS */
 enum imperator_flow_flags {
@@ -206,16 +208,18 @@ _Static_assert(sizeof(struct imperator_task_ctx) == 64,
     "imperator_task_ctx must be exactly 64B (one cache line) — update __pad if fields change");
 
 /* packed_info bitfield layout:
- * [Stable:2][Tier:2][Flags:4][Rsvd:8][Wait:8][Error:8]
- *  31-30     29-28   27-24    23-16   15-8     7-0      */
-#define SHIFT_KALMAN_ERROR  0
-#define SHIFT_WAIT_DATA     8
+ * [Stable:2][Tier:2][Flags:4][Rsvd:16]
+ *  31-30     29-28   27-24    23-0
+ *
+ * Bits [15:0] previously held WAIT_DATA [15:8] and KALMAN_ERROR [7:0].
+ * Both were written (KALMAN_ERROR initialised to 0xFF in alloc_task_ctx_cold)
+ * but never read by any scheduling decision in imperator_bpf.c, lock_bpf.c,
+ * or the Rust side.  Removed per W2 audit finding.  Bits [23:0] are now
+ * reserved (Rsvd) and must be zero except for future use. */
 #define SHIFT_FLAGS         24
 #define SHIFT_TIER          28
 #define SHIFT_STABLE        30
 
-#define MASK_KALMAN_ERROR   0xFF
-#define MASK_WAIT_DATA      0xFF
 #define MASK_TIER           0x03
 #define MASK_FLAGS          0x0F
 
@@ -231,6 +235,26 @@ _Static_assert(sizeof(struct imperator_task_ctx) == 64,
 /* MEGA-MAILBOX */
 #define MBOX_TIER_MASK    0x03
 #define MBOX_GET_TIER(f)  ((f) & MBOX_TIER_MASK)
+
+/* FIX (W1 / audit): Valid-written sentinel for mega_mailbox flags.
+ *
+ * PROBLEM: CAKE_TIER_CRITICAL = 0 encodes as flags = 0x00 & MBOX_TIER_MASK = 0x00.
+ * BSS zero-initialises the mailbox on scheduler load.  The former guard
+ * `cur_mbox_flags != 0` cannot distinguish "never written" from "T0 waker running":
+ * both produce flags == 0x00.  Result: waker-tier inheritance is unconditionally
+ * suppressed whenever the waker CPU's last task was T0 — exactly the path where
+ * a T0 audio thread should be promoting a T2 game thread to T1.
+ *
+ * FIX: bit 7 of flags is the VALID sentinel.  imperator_running always sets it
+ * when writing tier data.  The inheritance guard in imperator_enqueue checks this
+ * bit instead of the raw byte value.  T0 wakers now produce flags = 0x80 (valid,
+ * tier=0), T1 wakers produce 0x81, T2 produce 0x82 — all non-zero AND valid.
+ * The unwritten BSS state (0x00) no longer collides with any real tier value.
+ *
+ * BACKWARD COMPATIBILITY: MBOX_GET_TIER masks off bit 7 with MBOX_TIER_MASK (0x03)
+ * — existing tier extraction is unaffected.  The valid bit is orthogonal. */
+#define MBOX_VALID_BIT    7
+#define MBOX_VALID_FLAG   (1u << MBOX_VALID_BIT)   /* 0x80 */
 
 struct mega_mailbox_entry {
     u8 flags;

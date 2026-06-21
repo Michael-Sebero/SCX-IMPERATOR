@@ -166,8 +166,9 @@ UEI_DEFINE(uei);
 /* A+B ARCHITECTURE: Per-LLC DSQs with vtime-encoded priority.
  * DSQ IDs: LLC_DSQ_BASE + 0, LLC_DSQ_BASE + 1, ... (one per LLC). */
 
-/* Per-CPU Direct Dispatch Queues (1000-1063) */
-#define CAKE_DSQ_LC_BASE 1000
+/* FIX (W3): CAKE_DSQ_LC_BASE removed — defined as 1000 for per-CPU direct
+ * dispatch queues but never referenced after the per-LLC DSQ migration.
+ * Zero call sites confirmed by static analysis. */
 
 /* Tier config table - 4 tiers + padding, AoS layout: single cache line fetch */
 const fused_config_t tier_configs[8] = {
@@ -357,10 +358,14 @@ struct imperator_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
     ctx->deficit_avg_fused = PACK_DEFICIT_AVG(init_deficit, init_avg_rt);
 
     u32 packed = 0;
-    packed |= (255 & MASK_KALMAN_ERROR) << SHIFT_KALMAN_ERROR;
+    /* FIX (W2): Removed `packed |= (255 & MASK_KALMAN_ERROR) << SHIFT_KALMAN_ERROR`.
+     * KALMAN_ERROR and WAIT_DATA were defined in intf.h and initialised here but
+     * never read by any scheduling path.  The 255 init was a dead write that
+     * occupied bits [7:0] of packed_info with a constant value.  Both defines
+     * and this write are removed; bits [23:0] are now fully reserved (zero). */
     /* Fused TIER+FLAGS: bits [29:24] = [tier:2][flags:4] (Rule 37 coalescing) */
     packed |= (((u32)(init_tier & MASK_TIER) << 4) | (CAKE_FLOW_NEW & MASK_FLAGS)) << SHIFT_FLAGS;
-    /* stable=0, wait_data=0: implicit from packed=0 */
+    /* stable=0, rsvd=0: implicit from packed=0 */
 
     ctx->packed_info = packed;
 
@@ -798,25 +803,42 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
      *   - Never promotes above CAKE_TIER_CRITICAL (floor is 0).
      *   - Never demotes: if the wakee is already T0, this is a no-op.
      *   - One-dispatch only: does not alter packed_info, so EWMA is unaffected.
-     *   - Only when tick_counter > 0: mega_mailbox flags are zero-initialized
-     *     (BSS). If no tick has fired on the waker's CPU yet, waker_tier would
-     *     read 0 (CRITICAL) spuriously, promoting every T2/T3 wakee on first
-     *     boot. tick_counter is incremented on the very first tick, making
-     *     it a reliable "mailbox is valid" sentinel.
+     *   - Only when mailbox valid flag is set: mega_mailbox flags are zero-
+     *     initialized (BSS). If imperator_running has not yet executed on the
+     *     waker's CPU, waker_tier would read 0 (CRITICAL) spuriously, promoting
+     *     every T2/T3 wakee on first boot. MBOX_VALID_FLAG (bit 7) is set by
+     *     imperator_running on the very first context switch, making it an
+     *     unambiguous "mailbox has been written" sentinel that works even when the
+     *     waker's tier is T0 (which encodes as tier bits = 0x00).
+     *     (Previous guard used tick_counter > 0; replaced with MBOX_VALID_FLAG
+     *     per W1/W6 audit fix — tick_counter was never the actual guard condition
+     *     in the code, and `flags != 0` still failed for T0 wakers.)
      *
      * NOTE: enq_cpu is the waker's CPU — the same CPU that ran select_cpu
      * and is now running enqueue. mega_mailbox[enq_cpu].flags contains the
      * tier of the last task that ran on this CPU, set by imperator_tick. */
     if ((enq_flags & SCX_ENQ_WAKEUP) && tier > CAKE_TIER_CRITICAL) {
         struct mega_mailbox_entry *waker_mbox = &mega_mailbox[enq_cpu];
-        /* Guard: only inherit when imperator_running has written valid tier data to
-         * this CPU's mailbox.  imperator_running writes flags unconditionally on every
-         * context switch, so a non-zero flags byte means the mailbox is initialized.
-         * tick_counter was previously used here but becomes valid only after the
-         * first imperator_tick — a longer window than necessary since imperator_running
-         * makes the mailbox valid from the very first context switch. */
+        /* Guard: only inherit when imperator_running has written valid tier data.
+         *
+         * FIX (W1 / audit): Check MBOX_VALID_FLAG (bit 7) rather than `!= 0`.
+         *
+         * The previous guard `cur_mbox_flags != 0` was broken: CAKE_TIER_CRITICAL
+         * encodes as tier bits = 0x00, indistinguishable from the BSS-zero state.
+         * A CPU whose last running task was T0 wrote flags = 0x00, and the guard
+         * treated this identically to "never written" — permanently suppressing
+         * waker-tier inheritance for all T0 wakers.
+         *
+         * The fix uses MBOX_VALID_FLAG (bit 7 = 0x80), which imperator_running
+         * always ORs into flags alongside the tier.  The valid bit cannot be set
+         * by BSS zero-initialisation, making it an unambiguous "first write has
+         * occurred" sentinel.  T0 wakers now produce flags = 0x80 (valid + tier 0),
+         * which passes this guard and correctly triggers inheritance.
+         *
+         * MBOX_GET_TIER applies MBOX_TIER_MASK (0x03), masking off bit 7, so the
+         * tier value extracted below is unaffected by the valid flag. */
         u8 cur_mbox_flags = imperator_relaxed_load_u8(&waker_mbox->flags);
-        if (cur_mbox_flags != 0) {
+        if (cur_mbox_flags & MBOX_VALID_FLAG) {
             u8 waker_tier = MBOX_GET_TIER(cur_mbox_flags);
             if (waker_tier < tier) {
                 /* FIX (audit): Previous formula was waker_tier + 1, which meant a T1
@@ -1081,7 +1103,7 @@ void BPF_STRUCT_OPS(imperator_tick, struct task_struct *p)
      * two kick paths consistent. */
     if (unlikely(runtime > tctx_reg->next_slice)) {
         struct mega_mailbox_entry *exp_mbox = &mega_mailbox[cpu_id_reg];
-        u8 exp_flags = (tier_reg & MBOX_TIER_MASK);
+        u8 exp_flags = (u8)(MBOX_VALID_FLAG | (tier_reg & MBOX_TIER_MASK));
         if (imperator_relaxed_load_u8(&exp_mbox->flags) != exp_flags)
             imperator_relaxed_store_u8(&exp_mbox->flags, exp_flags);
         scx_bpf_kick_cpu(cpu_id_reg, SCX_KICK_PREEMPT);
@@ -1182,7 +1204,7 @@ void BPF_STRUCT_OPS(imperator_tick, struct task_struct *p)
                  * store as the mailbox_dvfs block) before kicking so the next
                  * wakee sees the correct tier.  DVFS is still skipped (next
                  * task's first tick will correct frequency within ~1ms). */
-                u8 kick_flags = (tier_reg & MBOX_TIER_MASK);
+                u8 kick_flags = (u8)(MBOX_VALID_FLAG | (tier_reg & MBOX_TIER_MASK));
                 if (imperator_relaxed_load_u8(&mbox->flags) != kick_flags)
                     imperator_relaxed_store_u8(&mbox->flags, kick_flags);
 
@@ -1210,7 +1232,9 @@ mailbox_dvfs:; /* FIX: empty statement separates label from declaration (C99 §6
      * MOV with a compiler barrier) and the targeted inline-asm store on older
      * compilers.  Both paths prevent compiler reordering and guarantee
      * architectural store visibility — the minimal requirement for a flag. */
-    u8 new_flags = (tier_reg & MBOX_TIER_MASK);
+    /* FIX (W1): OR in MBOX_VALID_FLAG so T0 wakers (tier=0) produce 0x80,
+     * not 0x00, preventing collision with the BSS-zero unwritten-mailbox state. */
+    u8 new_flags = (u8)(MBOX_VALID_FLAG | (tier_reg & MBOX_TIER_MASK));
     if (imperator_relaxed_load_u8(&mbox->flags) != new_flags)
         imperator_relaxed_store_u8(&mbox->flags, new_flags);
 
@@ -1310,12 +1334,18 @@ void BPF_STRUCT_OPS(imperator_running, struct task_struct *p)
      * at the worst time (right after a T0 audio thread is scheduled, the
      * mailbox might still show T3 from the bulk task it preempted).
      *
-     * Cost: one conditional relaxed store per context switch (~2 cycles on an
-     * uncontested cache line). */
+     * FIX (W1): Always OR in MBOX_VALID_FLAG (bit 7) when writing the tier.
+     * CAKE_TIER_CRITICAL = 0 encodes as tier bits = 0x00; without the valid flag
+     * a T0-running CPU writes 0x00 — identical to the BSS-zero unwritten state —
+     * and the guard in imperator_enqueue cannot distinguish "T0 waker" from
+     * "mailbox never written."  With MBOX_VALID_FLAG, T0 wakers write 0x80,
+     * T1 wakers write 0x81, T2 write 0x82.  MBOX_GET_TIER masks bit 7 off
+     * (MBOX_TIER_MASK = 0x03), so existing tier extraction is unaffected.
+     * Cost: one conditional relaxed store per context switch (~2 cycles). */
     u8 cur_flags = imperator_relaxed_load_u8(&mbox->flags);
-    if ((cur_flags & MBOX_TIER_MASK) != tier)
-        imperator_relaxed_store_u8(&mbox->flags,
-            (cur_flags & ~MBOX_TIER_MASK) | tier);
+    u8 new_flags = (u8)(MBOX_VALID_FLAG | (cur_flags & ~MBOX_TIER_MASK) | tier);
+    if (cur_flags != new_flags)
+        imperator_relaxed_store_u8(&mbox->flags, new_flags);
 
     /* [D] s6: Mark this CPU as running a task of 'tier'.
      * BPF_ATOMIC_OR: single instruction, not a CAS loop.  Each CPU writes
@@ -1689,9 +1719,9 @@ s32 BPF_STRUCT_OPS(imperator_init_task, struct task_struct *p,
         }
 
         /* Reset tier[29:28] + stable[31:30] to (stable=0, tier=init_tier).
-         * All other packed_info bits (FLAGS, WAIT_DATA, KALMAN_ERROR) are
-         * preserved — CAKE_FLOW_NEW is already set by alloc_task_ctx_cold
-         * and is still appropriate for a freshly exec'd process. */
+         * All other packed_info bits (FLAGS, Rsvd) are preserved — CAKE_FLOW_NEW
+         * is already set by alloc_task_ctx_cold and is still appropriate for a
+         * freshly exec'd process.  (WAIT_DATA and KALMAN_ERROR removed per W2.) */
         u32 packed = imperator_relaxed_load_u32(&tctx->packed_info);
         packed &= ~((u32)0xF << 28);
         packed |=  (u32)init_tier << SHIFT_TIER;
