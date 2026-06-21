@@ -21,7 +21,9 @@ pub const TIER_NAMES: [&str; 4] = [
 ///   [12]    nr_waker_tier_boosts
 ///   [13]    nr_preempt_with_credit      ← C3 earning counter
 ///   [14]    nr_burst_credit_consumed    ← C3 consumption counter
-///   [15..31] _pad[17]
+///   [15]    nr_jitter_ewma_sum          ← C2-Infra dispatch latency sum (W4 fix)
+///   [16]    nr_jitter_ewma_count        ← C2-Infra dispatch latency sample count
+///   [17..31] _pad[15]
 ///
 /// FIX (audit/Finding-4): Burst credit is accumulated AND consumed within the
 /// same `imperator_enqueue` invocation — credit earned on a preemption event is
@@ -39,10 +41,27 @@ pub const TIER_NAMES: [&str; 4] = [
 /// The graduation gate criterion remains unchanged: nr_starvation_preempts_tier[2]
 /// per second must decrease ≥20% under sustained T1+T2 competition before C3
 /// graduates from Experimental to Accepted.
-// These constants are not yet consumed by the TUI — they are declared here so
-// the correct indices are in one authoritative place and callers can import them
-// without recomputing the field offset from the struct layout table above.
+///
+/// Note: the TUI reads these fields by struct field name, not by integer index,
+/// so these constants are intentionally unused in code — they exist as the single
+/// authoritative source of truth for field offsets, useful for external tooling
+/// (bpftool, perf scripts, eBPF probes) that must address fields by offset.
+/// `#[allow(dead_code)]` suppresses the Rust compiler warning for this reason.
 #[allow(dead_code)]
-pub const STAT_IDX_PREEMPT_WITH_CREDIT: usize = 13;    // imperator_stats.nr_preempt_with_credit
+pub const STAT_IDX_PREEMPT_WITH_CREDIT: usize = 13;
 #[allow(dead_code)]
-pub const STAT_IDX_BURST_CREDIT_CONSUMED: usize = 14;  // imperator_stats.nr_burst_credit_consumed
+pub const STAT_IDX_BURST_CREDIT_CONSUMED: usize = 14;
+
+/// C2-Infra: Dispatch latency telemetry stat counter indices within imperator_stats.
+///
+/// nr_jitter_ewma_sum / nr_jitter_ewma_count are accumulated in imperator_running
+/// on every DSQ-path context switch where enqueue_time was non-zero.
+/// TUI computes: mean_dispatch_latency_us = sum / count.
+/// Both are per-CPU in BSS; summed across CPUs in aggregate_stats().
+///
+/// Same access pattern note as C3 constants above: read by field name in tui.rs,
+/// these index constants exist for external tooling only.
+#[allow(dead_code)]
+pub const STAT_IDX_JITTER_EWMA_SUM: usize = 15;
+#[allow(dead_code)]
+pub const STAT_IDX_JITTER_EWMA_COUNT: usize = 16;

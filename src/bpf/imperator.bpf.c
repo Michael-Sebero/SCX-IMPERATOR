@@ -271,7 +271,15 @@ struct imperator_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
      *   jitter EWMA update in imperator_running skips the update when 0.
      * jitter_ewma_us = 0: cold start; converges within ~8 context switches.
      * burst_credit = 0: no accumulated credit at task creation.
-     * __align_pad = 0: explicit zero matches the struct layout comment. */
+     * __align_pad = 0: explicit zero — matches the struct layout comment and
+     *   ensures the 3 alignment bytes between pending_futex_op and enqueue_time
+     *   are deterministically zero regardless of BPF storage guarantees.
+     *   FIX (W15 / Audit-4): the comment previously claimed this was explicit
+     *   but no store existed.  The three bytes are now written individually to
+     *   satisfy the claim without a memset (which is not available in BPF). */
+    ctx->__align_pad[0] = 0;
+    ctx->__align_pad[1] = 0;
+    ctx->__align_pad[2] = 0;
     ctx->enqueue_time   = 0;
     ctx->jitter_ewma_us = 0;
     ctx->burst_credit   = 0;
@@ -1318,6 +1326,20 @@ void BPF_STRUCT_OPS(imperator_running, struct task_struct *p)
         u32 new_ewma = (old_ewma * 7 + lat_us) >> 3;
         tctx->jitter_ewma_us = (u16)(new_ewma > 0xFFFF ? 0xFFFF : new_ewma);
         tctx->enqueue_time   = 0;  /* Consume stamp — prevents stale reads on next wakeup */
+
+        /* W4 / C2-Infra: Accumulate jitter sample into per-CPU stats aggregates.
+         * TUI computes mean_jitter_us = nr_jitter_ewma_sum / nr_jitter_ewma_count
+         * across all CPUs to surface scheduling latency without a BPF iterator.
+         * Uses the post-clamp EWMA value (not lat_us) so outliers are smoothed
+         * by the EWMA before entering the aggregate — the mean reflects the
+         * per-task steady-state latency, not transient spikes. */
+        if (enable_stats) {
+            struct imperator_stats *s = get_local_stats();
+            if (s) {
+                s->nr_jitter_ewma_sum   += (u64)tctx->jitter_ewma_us;
+                s->nr_jitter_ewma_count += 1;
+            }
+        }
     }
 
     u32 run_cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);

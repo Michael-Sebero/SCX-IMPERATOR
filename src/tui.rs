@@ -45,6 +45,18 @@ fn aggregate_stats(skel: &BpfSkel) -> imperator_stats {
             total.nr_lock_holder_skips += s.nr_lock_holder_skips;
             total.nr_irq_wake_boosts += s.nr_irq_wake_boosts;
             total.nr_waker_tier_boosts += s.nr_waker_tier_boosts;
+
+            // C3: Burst credit counters — required for graduation gate evaluation.
+            // nr_preempt_with_credit counts T1/T2 preemptions that earned credit;
+            // nr_burst_credit_consumed counts dispatches that extended their slice.
+            // Both are per-CPU in BSS and must be summed here like every other field.
+            total.nr_preempt_with_credit   += s.nr_preempt_with_credit;
+            total.nr_burst_credit_consumed += s.nr_burst_credit_consumed;
+
+            // W4 / C2-Infra: Sum dispatch latency aggregates so TUI can compute
+            // mean dispatch latency across all CPUs without a BPF iterator.
+            total.nr_jitter_ewma_sum   += s.nr_jitter_ewma_sum;
+            total.nr_jitter_ewma_count += s.nr_jitter_ewma_count;
         }
     }
 
@@ -69,6 +81,11 @@ pub struct StatsRates {
     pub starve_per_sec: [f64; 4],
     /// Lock-holder starvation skips per second (system-wide).
     pub lock_skip_per_sec: f64,
+    /// C3: T1/T2 preemptions earning burst credit per second.
+    /// Used alongside nr_starvation_preempts_tier[2] to evaluate the C3
+    /// graduation gate — a sustained non-zero rate confirms the credit
+    /// mechanism is actively firing during the test window.
+    pub burst_credit_per_sec: f64,
 }
 
 impl TuiApp {
@@ -108,11 +125,19 @@ impl TuiApp {
             self.prev_stats.nr_lock_holder_skips,
         );
 
+        // C3: Per-second rate of T1/T2 preemptions earning burst credit.
+        // Uses the same saturating-delta pattern as lock_skip_per_sec so
+        // counter resets via [r] produce zero rather than a wrap-around spike.
+        let burst_credit_per_sec = delta(
+            current.nr_preempt_with_credit,
+            self.prev_stats.nr_preempt_with_credit,
+        );
+
         // Advance snapshot
         self.prev_stats = *current;
         self.prev_tick  = Instant::now();
 
-        StatsRates { starve_per_sec, lock_skip_per_sec }
+        StatsRates { starve_per_sec, lock_skip_per_sec, burst_credit_per_sec }
     }
 
     /// Invalidate the previous-stats snapshot so the next tick_stats() call
@@ -920,6 +945,27 @@ fn format_stats_for_clipboard(stats: &imperator_stats, uptime: &str) -> String {
     output.push_str(&format!("  IRQ-source wakeup T0 boosts  : {}\n", stats.nr_irq_wake_boosts));
     output.push_str(&format!("  Waker tier inheritance boosts: {}\n", stats.nr_waker_tier_boosts));
 
+    // C3: Burst credit counters for graduation gate evaluation.
+    // The ratio consumed/credited is always ≈ 1.0 (credit earned and consumed
+    // in the same enqueue call); a value > 1.0 means prior accumulated credit
+    // was consumed alongside newly earned credit in a single dispatch.
+    output.push_str("\nC3 Burst credit counters:\n");
+    output.push_str(&format!("  Preemptions earning credit   : {}\n", stats.nr_preempt_with_credit));
+    output.push_str(&format!("  Dispatches consuming credit  : {}\n", stats.nr_burst_credit_consumed));
+
+    // W4 / C2-Infra: Dispatch latency telemetry.
+    // mean_jitter_us is the arithmetic mean of all per-task jitter_ewma_us
+    // samples accumulated since scheduler start (or last reset).  Provides
+    // the jitter baseline described in the C2-Infra design; closes W4.
+    output.push_str("\nC2-Infra Dispatch latency telemetry:\n");
+    if stats.nr_jitter_ewma_count == 0 {
+        output.push_str("  Mean dispatch latency        : — (no DSQ-path samples yet)\n");
+    } else {
+        let mean_us = stats.nr_jitter_ewma_sum as f64 / stats.nr_jitter_ewma_count as f64;
+        output.push_str(&format!("  Mean dispatch latency        : {:.1}µs\n", mean_us));
+        output.push_str(&format!("  Sample count                 : {}\n", stats.nr_jitter_ewma_count));
+    }
+
     output
 }
 
@@ -1061,20 +1107,39 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &imperator_stats, rates: &Sta
     // Show lock_skip/s alongside total so the cap behaviour (Fix 2) is visible:
     // persistent lock_skip/s > 0 after the cap fires indicates a task spending
     // most of its time holding a futex — useful for diagnosing Wine/Proton stalls.
+    //
+    // C3: burst_credit_per_sec is the primary live signal for the graduation gate.
+    // Show "—" when zero (quiet) to match the lock_skip treatment; non-zero means
+    // T1/T2 preemptions are actively earning credit during this window.
     let total_starvation: u64 = stats.nr_starvation_preempts_tier.iter().sum();
     let lock_skip_rate_str = if rates.lock_skip_per_sec < 0.05 {
         String::from("—")
     } else {
         format!("{:.1}/s", rates.lock_skip_per_sec)
     };
+    let burst_credit_rate_str = if rates.burst_credit_per_sec < 0.05 {
+        String::from("—")
+    } else {
+        format!("{:.0}/s", rates.burst_credit_per_sec)
+    };
+    // W4 / C2-Infra: Compute mean dispatch latency from per-CPU aggregates.
+    // Shown as "—" until at least one DSQ-path dispatch has been measured so
+    // the display is not misleading at startup or on SYNC-only workloads.
+    let mean_jitter_str = if stats.nr_jitter_ewma_count == 0 {
+        String::from("—")
+    } else {
+        format!("{:.0}µs", stats.nr_jitter_ewma_sum as f64 / stats.nr_jitter_ewma_count as f64)
+    };
     let summary_text = format!(
-        " Dispatches: {} | Starvation preempts: {} | Lock skips: {} ({}) | IRQ boosts: {} | Waker boosts: {}",
+        " Dispatches: {} | Starvation preempts: {} | Lock skips: {} ({}) | IRQ boosts: {} | Waker boosts: {} | Burst credit: {} | Dispatch latency: {}",
         stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches,
         total_starvation,
         stats.nr_lock_holder_skips,
         lock_skip_rate_str,
         stats.nr_irq_wake_boosts,
         stats.nr_waker_tier_boosts,
+        burst_credit_rate_str,
+        mean_jitter_str,
     );
 
     let summary = Paragraph::new(summary_text).block(

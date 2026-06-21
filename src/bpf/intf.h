@@ -288,7 +288,28 @@ struct imperator_stats {
      *   but are re-preempted before consuming it will show a gap). */
     u64 nr_preempt_with_credit;
     u64 nr_burst_credit_consumed;
-    u64 _pad[17];
+
+    /* C2-Infra: Dispatch latency telemetry aggregates — closes W4.
+     *
+     * jitter_ewma_us is per-task state in imperator_task_ctx and is not directly
+     * accessible from the TUI without a BPF iterator.  Instead, imperator_running
+     * accumulates two u64 aggregates here so the TUI can compute a system-wide
+     * mean dispatch latency without new BPF infrastructure:
+     *
+     *   mean_jitter_us = nr_jitter_ewma_sum / nr_jitter_ewma_count
+     *
+     * nr_jitter_ewma_sum: sum of jitter_ewma_us samples (in ~µs units) added
+     *   to each context switch where enqueue_time was non-zero (DSQ path only).
+     *   Per-CPU; summed in aggregate_stats() in tui.rs.
+     *
+     * nr_jitter_ewma_count: number of samples added.  Always incremented in
+     *   lockstep with nr_jitter_ewma_sum so the ratio is always valid.
+     *
+     * These fields overflow at ~18 × 10^18 samples (u64 max).  At 100K context
+     * switches/sec this takes ~5.8 million years — not a practical concern. */
+    u64 nr_jitter_ewma_sum;
+    u64 nr_jitter_ewma_count;
+    u64 _pad[15];
 } __attribute__((aligned(64)));
 
 /* Defaults (Gaming profile) */

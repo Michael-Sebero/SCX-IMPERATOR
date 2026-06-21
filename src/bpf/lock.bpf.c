@@ -115,10 +115,27 @@ static __always_inline void clear_lock_holder(void)
         __sync_fetch_and_and(&tctx->packed_info,
                              ~((u32)CAKE_FLAG_LOCK_HOLDER << SHIFT_FLAGS));
         /* Reset the skip counter so the next lock acquisition starts with a
-         * fresh cap of 4 consecutive skip allowances.  Plain store is safe:
-         * lock_skip_count is only read and written by imperator_tick on the CPU
-         * currently running this task, and clear_lock_holder fires in a
-         * fexit/tracepoint context on the same CPU. */
+         * fresh cap of 4 consecutive skip allowances.
+         *
+         * FIX (W10 / Audit-3): The previous comment claimed "lock_skip_count is
+         * only read and written by imperator_tick" — this is inaccurate.
+         * clear_lock_holder() also writes it (this very store).  The correct
+         * invariant is:
+         *
+         *   imperator_tick increments lock_skip_count ONLY when
+         *   CAKE_FLAG_LOCK_HOLDER is set (checked atomically from packed_info).
+         *   clear_lock_holder() clears the flag atomically (line above) BEFORE
+         *   writing lock_skip_count = 0.  If a timer interrupt fires between the
+         *   two stores, it sees the flag already cleared and skips the increment
+         *   entirely — so lock_skip_count is never incremented after this reset.
+         *
+         * On x86 (TSO): the ordering guarantee is provided by the processor's
+         * total-store order — the plain store is visible before any subsequent
+         * reads on the same CPU.  Safe on the stated x86 target.
+         *
+         * On ARM64 (weakly-ordered): a store-release fence would be required to
+         * guarantee visibility to a concurrent timer interrupt.  Plain store is
+         * technically a data race on ARM64 — revisit if ARM64 is ever targeted. */
         tctx->lock_skip_count = 0;
     }
 }
@@ -391,6 +408,22 @@ int imperator_tp_exit_futex(struct tp_imperator_futex_exit *ctx)
             clear_lock_holder();
         break;
     }
+
+    /* FIX (Bug-2): Reset pending_futex_op to UNSET after consuming it.
+     *
+     * The alloc_task_ctx_cold sentinel (0xFF) was designed to protect only
+     * the first syscall — the window before any sys_enter_futex has recorded
+     * a real op.  Without this reset, after the first real op is consumed the
+     * field holds a stale value indefinitely.  If sys_exit_futex were to fire
+     * without a preceding sys_enter_futex updating the field (a narrow but
+     * theoretically possible ordering under the dual fexit+tracepoint attach
+     * model described in this file's header), the stale op would be acted on.
+     *
+     * Resetting to UNSET here restores the sentinel unconditionally after
+     * every consumption, making the first-call protection permanent: the field
+     * is only non-UNSET for the exact window between a sys_enter_futex and its
+     * matching sys_exit_futex, which is the designed intent. */
+    tctx->pending_futex_op = CAKE_FUTEX_OP_UNSET;
 
     return 0;
 }
