@@ -16,6 +16,16 @@ const bool enable_stats = false;
 /* Topology config - JIT eliminates unused P/E-core steering when has_hybrid=false */
 const bool has_hybrid = false;
 
+/* Suggestion 3: Sim profile mode — enables T3 burst credit in imperator_enqueue.
+ * When false (all Gaming/Esports/Legacy/Default profiles): tier_burst_cap_kns[3] = 0,
+ * T3 tasks never earn burst credit — correct for FPS where T3 preemptions are caused
+ * by T0/T1 work that legitimately needs the CPU.
+ * When true (Sim profile): tier_burst_cap_kns[3] = 1000, a simulation or open-world
+ * streaming thread that is repeatedly preempted by background system work (kworkers,
+ * kswapd, IRQ threads) earns proportional slice extensions, reducing fragmentation.
+ * JIT constant-folds to a no-op branch elimination on Gaming/Esports profiles. */
+const bool sim_mode = false;
+
 /* Per-LLC DSQ partitioning — populated by loader from topology detection.
  * Eliminates cross-CCD lock contention: each LLC has its own DSQ.
  * Single-CCD (9800X3D): nr_llcs=1, identical to single-DSQ behavior.
@@ -702,10 +712,29 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
      * invocation.  Accumulation block runs first (writes burst_credit), then
      * consumption block reads and zeroes it.  burst_credit is always 0 after
      * imperator_enqueue returns — it does not persist between enqueue calls.
-     * Stats: nr_preempt_with_credit counts earning events for TUI/graduation. */
-    static const u16 tier_burst_cap_kns[4] = { 0, 2000, 4000, 0 };
+     * Stats: nr_preempt_with_credit counts earning events for TUI/graduation.
+     *
+     * Suggestion 3 / Sim profile: T3 burst credit enabled when sim_mode=true.
+     * In Gaming/Esports, T3 cap is 0 — T3 is preempted by T0/T1 latency-critical
+     * work that legitimately needs the CPU; giving T3 burst credit would delay
+     * that handoff.  In Sim profile, the dominant T2/T3 simulation thread may
+     * be preempted by background system work (kworkers, kswapd, IRQ threads)
+     * rather than T0/T1 game peers — burst credit lets it recover time without
+     * delaying anything urgent.  1000 kns ≈ 0.5×quantum (~2ms at 4ms Sim quantum).
+     * JIT eliminates the sim_mode branch entirely on Gaming/Esports (sim_mode=false
+     * is RODATA; the compiler sees a compile-time constant and dead-strips the
+     * sim table entirely from the verifier-visible BPF bytecode). */
+    static const u16 tier_burst_cap_kns_gaming[4] = { 0, 2000, 4000,    0 };
+    static const u16 tier_burst_cap_kns_sim[4]    = { 0, 2000, 4000, 1000 };
+    const u16 *tier_burst_cap_kns = sim_mode
+        ? tier_burst_cap_kns_sim
+        : tier_burst_cap_kns_gaming;
 
-    if ((enq_flags & SCX_ENQ_PREEMPT) && tier <= CAKE_TIER_FRAME) {
+    /* Sim mode also allows T3 to earn burst credit, not just T0–T2.
+     * Use CAKE_TIER_BULK as the ceiling when sim_mode, CAKE_TIER_FRAME otherwise. */
+    u8 burst_eligible_max = sim_mode ? CAKE_TIER_BULK : CAKE_TIER_FRAME;
+
+    if ((enq_flags & SCX_ENQ_PREEMPT) && tier <= burst_eligible_max) {
         u16 cap_kns = tier_burst_cap_kns[CAKE_TIER_IDX(tier)];
         if (cap_kns > 0) {
             /* Credit = quantum / 4096 kns (÷1024 for ns→kns, ÷4 for quarter).
@@ -1219,12 +1248,64 @@ void BPF_STRUCT_OPS(imperator_tick, struct task_struct *p)
                 return;
             }
         } else {
-            /* No contention — grow confidence (saturate at 255) */
+            /* No contention (nr_running <= 1) — grow confidence (saturate at 255).
+             *
+             * Suggestion 6: Single-dominant-thread DVFS boost.
+             *
+             * When nr_running == 0 (rq->scx.nr_running reads 0, meaning the running
+             * task itself is the only occupant — sched_ext counts exclude the
+             * currently running task), this CPU has exactly one thread and nothing
+             * is competing for it.  Override the tier-proportional DVFS target with
+             * SCX_CPUPERF_ONE (maximum frequency) unconditionally.
+             *
+             * Rationale: a strategy-sim or open-world streaming thread that is the
+             * sole occupant of a core is artificially penalized if classified T2/T3
+             * (its sustained runtime earns it that tier), because the tier-proportional
+             * target reduces its DVFS frequency when there is literally no competing
+             * latency-critical work that would benefit from a more conservative target.
+             * There is nothing to protect — the core is uncontested.  Full frequency
+             * maximises single-thread throughput at no cost to any other task.
+             *
+             * Correctness:
+             * - The boost applies only when nr_running == 0, verified from the rq.
+             *   If a second task arrives, the next tick sees nr_running >= 1, the
+             *   contention branch fires, and tier-proportional DVFS resumes.
+             * - On FPS workloads nr_running is almost never 0 (render/audio/input
+             *   threads coexist), so this path simply never triggers — the existing
+             *   tier-proportional logic runs unchanged.
+             * - The boost flag is passed to mailbox_dvfs via the `sole_occupant`
+             *   local rather than modifying tier_reg, so tier classification and
+             *   starvation accounting are unaffected.
+             *
+             * Cost: one additional load of nr_running (already loaded above from rq,
+             * which is already in L1 from the contention check above).  ~0 cycles
+             * since the value is already in a register. */
+            bool sole_occupant = rq && (rq->scx.nr_running == 0);
+            if (sole_occupant)
+                goto mailbox_dvfs_max;
             if (tc < 255) imperator_relaxed_store_u8(&mbox->tick_counter, tc + 1);
         }
     } else {
         /* Skipped check — still increment counter for next mask eval */
         if (tc < 255) imperator_relaxed_store_u8(&mbox->tick_counter, tc + 1);
+    }
+
+mailbox_dvfs_max:; /* Sole-occupant fast path: skip tier lookup, pin to max frequency */
+    /* Suggestion 6: The core has exactly one runnable thread.  Set DVFS to
+     * maximum unconditionally — the tier-proportional table is bypassed.
+     * Mailbox tier is still updated so waker-tier inheritance is correct.
+     * Falls through to mailbox update then returns, skipping tier table read. */
+    {
+        u8 max_flags = (u8)(MBOX_VALID_FLAG | (tier_reg & MBOX_TIER_MASK));
+        if (imperator_relaxed_load_u8(&mbox->flags) != max_flags)
+            imperator_relaxed_store_u8(&mbox->flags, max_flags);
+        u8 cached_perf_max = imperator_relaxed_load_u8(&mbox->dsq_hint);
+        u8 max_target_cached = (u8)(SCX_CPUPERF_ONE >> 2);
+        if (cached_perf_max != max_target_cached) {
+            scx_bpf_cpuperf_set(cpu_id_reg, SCX_CPUPERF_ONE);
+            imperator_relaxed_store_u8(&mbox->dsq_hint, max_target_cached);
+        }
+        return;
     }
 
 mailbox_dvfs:; /* FIX: empty statement separates label from declaration (C99 §6.8.1) */

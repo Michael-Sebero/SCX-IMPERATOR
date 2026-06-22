@@ -32,6 +32,25 @@ pub enum Profile {
     Legacy,
     Gaming,
     Default,
+    /// Simulation / strategy game profile.
+    ///
+    /// Optimises for workloads with a dominant long-running simulation or
+    /// open-world streaming thread (RTS, 4X, city-builder, open-world RPG)
+    /// rather than many short-burst latency-critical threads.
+    ///
+    /// Changes vs Gaming:
+    ///   - Larger quantum (4ms) reduces context-switch overhead on sustained T2/T3
+    ///   - Looser starvation thresholds: T3 gets 200ms before forced preemption
+    ///     (matches Legacy) since nothing latency-critical is competing for the core
+    ///   - T3 burst credit enabled (see tier_burst_cap_kns in imperator_bpf.c):
+    ///     a simulation thread repeatedly preempted by background system work
+    ///     earns slice extensions proportional to how often it was interrupted
+    ///   - T0/T1 thresholds are unchanged — audio and input remain protected
+    ///
+    /// FPS workloads running under this profile will behave correctly but
+    /// may experience slightly higher background-task latency (looser T3
+    /// starvation) than Gaming. Use Gaming/Esports for competitive FPS.
+    Sim,
 }
 
 impl Profile {
@@ -41,6 +60,11 @@ impl Profile {
             Profile::Legacy  => (4000, 12000, 200000),
             Profile::Gaming  => (2000, 8000, 100000),
             Profile::Default => Profile::Gaming.values(),
+            // Sim: 4ms quantum (matches Legacy — reduces context-switch overhead
+            // on sustained T2/T3 work), 8ms new-flow bonus (matches Gaming),
+            // 200ms T3 starvation (matches Legacy — sim threads are long-running
+            // by nature and nothing latency-critical competes with them).
+            Profile::Sim => (4000, 8000, 200000),
         }
     }
 
@@ -58,6 +82,15 @@ impl Profile {
                 3_000_000, 8_000_000, 40_000_000, 100_000_000,
                 100_000_000, 100_000_000, 100_000_000, 100_000_000,
             ],
+            // Sim: T0/T1 identical to Gaming (audio/input latency unchanged),
+            // T2 loosened to 80ms (matches Legacy — render threads in sim games
+            // have longer, more variable frame times than in FPS titles),
+            // T3 at 200ms (matches Legacy — sim thread is long-running by design,
+            // nothing latency-critical is competing).
+            Profile::Sim => [
+                3_000_000, 8_000_000, 80_000_000, 200_000_000,
+                200_000_000, 200_000_000, 200_000_000, 200_000_000,
+            ],
         }
     }
 
@@ -66,6 +99,11 @@ impl Profile {
             Profile::Esports => [256, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
             Profile::Gaming | Profile::Default => [512, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
             Profile::Legacy => [768, 1024, 1536, 2048, 2048, 2048, 2048, 2048],
+            // Sim: T0 multiplier matches Gaming (no change to critical latency),
+            // T1/T2 unchanged, T3 multiplier at 4095 (same as Gaming/Esports max)
+            // — with a 4ms base quantum, T3 gets up to ~16ms quanta, reducing
+            // context-switch fragmentation for sustained simulation work.
+            Profile::Sim => [512, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
         }
     }
 
@@ -74,6 +112,10 @@ impl Profile {
             Profile::Esports => [50_000, 1_000_000, 4_000_000, 0, 0, 0, 0, 0],
             Profile::Legacy  => [200_000, 4_000_000, 16_000_000, 0, 0, 0, 0, 0],
             Profile::Gaming | Profile::Default => [100_000, 2_000_000, 8_000_000, 0, 0, 0, 0, 0],
+            // Sim: T0/T1 wait budgets match Gaming (audio/input unchanged),
+            // T2 budget loosened to match Legacy (longer frame times tolerated),
+            // T3 budget 0 — simulation threads should not be debt-throttled.
+            Profile::Sim => [100_000, 2_000_000, 16_000_000, 0, 0, 0, 0, 0],
         }
     }
 
@@ -250,6 +292,15 @@ impl<'a> Scheduler<'a> {
             rodata.enable_stats     = args.verbose;
             rodata.tier_configs     = args.profile.tier_configs(quantum, args.starvation);
             rodata.has_hybrid       = topo.has_hybrid_cores;
+
+            // Suggestion 3: sim_mode enables T3 burst credit in imperator_enqueue.
+            // In Gaming/Esports profiles, T3 burst credit is always 0 (T3 bulk
+            // work should not earn slice extensions when preempted by T0/T1).
+            // In Sim profile, T3 may be the dominant workload with nothing
+            // latency-critical competing — T3 burst credit lets a simulation
+            // thread earn recovery time when repeatedly preempted by background
+            // system work (kworkers, kswapd, etc.) rather than T0/T1 peers.
+            rodata.sim_mode         = matches!(args.profile, Profile::Sim);
 
             let llc_count = topo.llc_cpu_mask.iter().filter(|&&m| m != 0).count() as u32;
             rodata.nr_llcs = llc_count.max(1);
@@ -444,7 +495,15 @@ impl<'a> Scheduler<'a> {
                     let cost: u8 = if min_ns == f64::MAX {
                         0
                     } else {
-                        ((min_ns / 4.0) as u64).min(255) as u8
+                        // FIX (Bug-3): floor at 1 so a legitimately measured but
+                        // sub-4ns result (physically impossible for cross-LLC but
+                        // not rejected by the type system) is never written as 0.
+                        // The BPF side uses `cost == 0` as "uncalibrated" sentinel;
+                        // a 0 written here would cause that LLC pair to be skipped
+                        // in ETD steal ordering, falling back to index order as if
+                        // calibration had never run.  .max(1) is consistent with
+                        // calibrate.rs's own 500ns sentinel for affinity failures.
+                        ((min_ns / 4.0) as u64).min(255).max(1) as u8
                     };
                     bss.llc_etd_cost[llc_a][llc_b] = cost;
                 }

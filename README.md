@@ -9,7 +9,7 @@
 > - **Waker Tier Inheritance** High-priority task waking a lower-priority one lifts the wakee's tier, keeping producer-consumer chains tight
 > - **Lock-Holder Protection** Futex holders get scheduling priority and starvation skips to release locks faster, unblocking waiters sooner
 > - **ETD Calibration** Startup CAS ping-pong measures actual inter-core latency; work stealing always prefers the cheapest path
-> - **Dispatch Latency Telemetry** Every task tracks its own scheduling latency (enqueue-to-dispatch) as a per-task EWMA; first per-task jitter signal in the scheduler
+> - **Dispatch Latency Telemetry** Every task tracks its own scheduling latency (enqueue-to-dispatch) as a per-task EWMA; mean dispatch latency is shown live in the TUI summary bar and clipboard export
 > - **Preemption Burst Credit** T1/T2 tasks repeatedly interrupted before completing their quantum earn slice extensions proportional to how many times they were cut short
 
 ## Navigation
@@ -132,7 +132,9 @@ The cap of 4 skips bounds the maximum extra latency any waiter can experience to
 
 Every task records a timestamp when it enters the dispatch queue (`enqueue_time`) and measures how long it waited before actually running. This per-task dispatch latency is tracked as an α=1/8 EWMA stored in `jitter_ewma_us` — the first per-task scheduling jitter signal in the scheduler.
 
-This is a measurement layer, not a policy layer on its own. It records what is happening so that future decisions and external tooling can act on it. The signal resets on exec and fork, and is skipped for tasks dispatched via the SYNC or idle-direct fast paths (which bypass the queue entirely and have no meaningful wait time to record).
+Each context switch accumulates the current EWMA sample into two per-CPU counters (`nr_jitter_ewma_sum`, `nr_jitter_ewma_count`) in `imperator_stats`. The TUI aggregates these across all CPUs and displays the mean dispatch latency live in the summary bar (`Dispatch latency: Xµs`) and in the clipboard export under `C2-Infra Dispatch latency telemetry`.
+
+The signal resets on exec and fork, and is skipped for tasks dispatched via the SYNC or idle-direct fast paths (which bypass the queue entirely and have no meaningful wait time to record). On pure SYNC workloads the counter stays at zero and the TUI shows `—` rather than a misleading value.
 
 ### Preemption Burst Credit
 
@@ -160,8 +162,14 @@ Three profiles are selectable at launch. `Default` is identical to `Gaming`.
 | **Gaming** | 2ms | 8ms | 100ms | 0.5× | ~4× |
 | **Esports** | 1ms | 4ms | 50ms | 0.25× | ~4× |
 | **Legacy** | 4ms | 12ms | 200ms | 0.75× | 2× |
+| **Sim** | 4ms | 8ms | 200ms | 0.5× | ~4× |
 
-**Gaming** works well for most desktops. **Esports** tightens everything shorter slices, half the starvation windows, lower T0 multiplier use it for minimum latency above all else. **Legacy** leans toward fairness; background work completes at a more reasonable pace.
+**Gaming** works well for most desktops. **Esports** tightens everything — shorter slices, half the starvation windows, lower T0 multiplier — use it for minimum latency above all else. **Legacy** leans toward fairness; background work completes at a more reasonable pace.
+
+**Sim** is designed for strategy, 4X, city-builder, and open-world games where a simulation or streaming thread is the dominant workload. It uses a 4ms quantum (reduces context-switch fragmentation on sustained T2/T3 work), looser T2/T3 starvation thresholds (nothing latency-critical is competing with the sim thread), and enables T3 burst credit — a simulation thread repeatedly preempted by background system work earns proportional slice extensions. T0/T1 latency (audio, input, compositor) is unchanged from Gaming.
+
+> [!NOTE]
+> **Sim vs Gaming on FPS titles:** Sim's looser T3 starvation threshold (200ms) means background tasks take longer to get preempted. On a pure FPS workload this is harmless — background tasks in a gaming session rarely saturate any core — but the safe choice for competitive play remains **Esports** or **Gaming**.
 
 The `--starvation` flag scales all tier thresholds proportionally from the T3 base, preserving inter-tier ratios.
 
@@ -289,7 +297,7 @@ All new fields (`enqueue_time`, `jitter_ewma_us`, `burst_credit`) sit on the sam
 | **Starvation** | Maximum time a task can wait without running before preemption is forced, regardless of tier ordering. |
 | **DRR++** | Deficit Round Robin++. Network CAKE flow-fairness algorithm adapted for CPU task scheduling. |
 | **Jitter** | Variance in scheduling latency between consecutive events. Low jitter = consistent frame delivery. |
-| **Dispatch Latency** | Time between a task entering the dispatch queue and actually running. Tracked per-task as `jitter_ewma_us`. |
+| **Dispatch Latency** | Time between a task entering the dispatch queue and actually running. Tracked per-task as `jitter_ewma_us`; mean shown live in TUI summary bar. |
 | **Burst Credit** | Per-task slice extension credit earned by T1/T2 tasks on each preemption, consumed on the next dispatch. Bounds: T1 ≈ 2ms, T2 ≈ 4ms. Zeroed on tier change, exec, and fork. |
 | **kns** | Kilonanoseconds — nanoseconds divided by 1024 (right-shift by 10). Internal unit used for deficit and burst credit to keep values in u16 range. |
 
