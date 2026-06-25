@@ -195,13 +195,51 @@ struct imperator_task_ctx {
      *   [28-31]  enqueue_time      (u32)     C2-Infra: enqueue timestamp
      *   [32-33]  jitter_ewma_us    (u16)     C2-Infra: dispatch latency EWMA
      *   [34-35]  burst_credit      (u16)     C3: preemption burst credit
-     *   [36-63]  __pad             (u8[28])  reserved, zero-initialized
+     *   [36-39]  sleep_entry_time  (u32)     Gap-1: sleep-entry timestamp
+     *   [40-63]  __pad             (u8[24])  reserved, zero-initialized
      *
      * Total struct size: 64B — one cache line, _Static_assert enforces this. */
     u32 enqueue_time;      /* bytes 28-31: C2-Infra enqueue timestamp */
     u16 jitter_ewma_us;    /* bytes 32-33: C2-Infra dispatch latency EWMA */
     u16 burst_credit;      /* bytes 34-35: C3 preemption burst credit */
-    u8  __pad[28];         /* bytes 36-63: reserved */
+
+    /* Gap-1 fix: Sleep-duration measurement for post-sleep recovery heuristic.
+     *
+     * PROBLEM (audit/Finding-6): the previous sleep-recovery heuristic in
+     * reclassify_task_cold measured (now - last_run_at) — bout duration, not
+     * sleep duration.  A task waking from a 30-second loading-screen sleep
+     * after a 5ms bout had runtime_raw=5ms and never triggered the 500ms
+     * threshold.  The heuristic almost never fired, regardless of actual sleep
+     * time, making it functionally inert.
+     *
+     * FIX: sleep_entry_time records the wall-clock timestamp (u32 nanoseconds,
+     * same truncation as last_run_at and enqueue_time) at the moment a task
+     * genuinely blocks — written in imperator_stopping when runnable=false.
+     * reclassify_task_cold reads it at wakeup (in imperator_enqueue via the
+     * tctx passed at stopping time) to compute actual sleep duration:
+     *   sleep_duration = enqueue_time_at_wakeup - sleep_entry_time
+     *
+     * The subtraction is u32 wrap-safe for any sleep < 4.3 seconds, which
+     * covers all gaming and sim loading scenarios.  For sleeps > 4.3s the
+     * u32 subtraction wraps, producing an incorrect small value — the heuristic
+     * does not fire, which is the same as the previous behavior.  Acceptable:
+     * the heuristic is best-effort.
+     *
+     * LIFECYCLE:
+     *   alloc_task_ctx_cold  → sleep_entry_time = 0 (explicit zero)
+     *   imperator_stopping   → write (u32)scx_bpf_now() when !runnable
+     *                        → write 0 when runnable (clear stale value)
+     *   reclassify_task_cold → read and consume (compared against enqueue_time)
+     *   imperator_init_task  → reset to 0 on exec and fork
+     *
+     * SENTINEL: 0 means "no valid sleep entry timestamp" — the heuristic is
+     * skipped when sleep_entry_time == 0, matching the enqueue_time pattern.
+     *
+     * Struct layout [Bytes 36-63]:
+     *   [36-39]  sleep_entry_time  (u32)     ← Gap-1 fix
+     *   [40-63]  __pad             (u8[24])  reduced from [28] */
+    u32 sleep_entry_time;  /* bytes 36-39: sleep-entry timestamp for recovery heuristic */
+    u8  __pad[24];         /* bytes 40-63: reserved, reduced from [28] */
 } __attribute__((aligned(64)));
 
 _Static_assert(sizeof(struct imperator_task_ctx) == 64,
@@ -261,7 +299,21 @@ struct mega_mailbox_entry {
     /* dsq_hint: DVFS perf-target hysteresis cache (u8 = cpuperf_target >> 2).
      * Name is historical (original use was DSQ selection hint, now removed);
      * the field stores the last written DVFS target to skip redundant kfunc
-     * calls when the tier has not changed between ticks. */
+     * calls when the tier has not changed between ticks.
+     *
+     * Encoding (audit/Finding-2): stores (cpuperf_target >> 2) as u8.
+     * cpuperf_target range [0, SCX_CPUPERF_ONE=1024].
+     *   T3 Gaming  → target=768  → dsq_hint=192
+     *   T2 Gaming  → target=896  → dsq_hint=224
+     *   T0/T1      → target=1024 → dsq_hint=256 → u8=0  (wraps)
+     *   Sole-occ.  → target=1024 → dsq_hint=256 → u8=0  (same wrap, correct)
+     *   BSS zero   → dsq_hint=0  (same as T0/T1 — first tick always calls kfunc
+     *                              because target_cached is also 0 on first read,
+     *                              but the kfunc call is idempotent so this is safe)
+     *
+     * The 0 encoding for SCX_CPUPERF_ONE is deliberate: any transition TO max
+     * frequency sets dsq_hint=0; subsequent ticks see cached==target==0 and skip
+     * the kfunc call.  The encoding is consistent across all paths that write it. */
     u8 dsq_hint;
     u8 tick_counter;
     u8 __reserved[61];

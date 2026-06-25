@@ -293,6 +293,46 @@ impl<'a> Scheduler<'a> {
             rodata.tier_configs     = args.profile.tier_configs(quantum, args.starvation);
             rodata.has_hybrid       = topo.has_hybrid_cores;
 
+            // Gap-4 / Suggestion 1: Wire big_cpu_mask to BPF RODATA.
+            // topology.rs computes this as a u64 bitmask of P-core / big-core
+            // CPU IDs during sched_ext attachment.  Previously this field was
+            // computed but never written to BPF — imperator knew hybrid cores
+            // existed (has_hybrid) but had no placement information about which
+            // specific CPUs were P-cores.  Writing it here completes the wiring
+            // that enables imperator_select_cpu's idle-path P-core preference.
+            // On non-hybrid systems: big_cpu_mask stays 0 (default), and the
+            // has_hybrid=false RODATA gate in BPF ensures the mask is never read.
+            rodata.big_cpu_mask     = topo.big_cpu_mask;
+
+            // Wire the five previously-dead topology fields to BPF RODATA.
+            // These were computed correctly in topology.rs and received correctness
+            // fixes this session but were never forwarded to BPF until now.
+            //
+            // cpu_core_id: physical core ID per logical CPU — bridge from CPU
+            //   index to core_cpu_mask / core_thread_mask lookups in BPF.
+            // cpu_thread_bit: SMT thread slot bitmask per logical CPU — used in
+            //   core occupancy checks for fully-idle core detection.
+            // core_cpu_mask: 64-bit bitmask of all logical CPUs per physical
+            //   core — enables SMT-aware hybrid placement steering.
+            // core_thread_mask: bitmask of all SMT slots per physical core —
+            //   denominator for fully-idle core detection.
+            // threads_per_ccd: logical CPU count of largest CCD — CCD-fill
+            //   threshold for work-stealing: don't steal from an LLC with fewer
+            //   queued tasks than it has CPU threads.
+            for (i, &v) in topo.cpu_core_id.iter().enumerate().take(64) {
+                rodata.cpu_core_id[i] = v as u32;
+            }
+            for (i, &v) in topo.cpu_thread_bit.iter().enumerate().take(64) {
+                rodata.cpu_thread_bit[i] = v as u32;
+            }
+            for (i, &v) in topo.core_cpu_mask.iter().enumerate().take(32) {
+                rodata.core_cpu_mask[i] = v;
+            }
+            for (i, &v) in topo.core_thread_mask.iter().enumerate().take(32) {
+                rodata.core_thread_mask[i] = v as u32;
+            }
+            rodata.threads_per_ccd  = topo.threads_per_ccd;
+
             // Suggestion 3: sim_mode enables T3 burst credit in imperator_enqueue.
             // In Gaming/Esports profiles, T3 burst credit is always 0 (T3 bulk
             // work should not earn slice extensions when preempted by T0/T1).

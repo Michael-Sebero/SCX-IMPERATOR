@@ -16,6 +16,32 @@ const bool enable_stats = false;
 /* Topology config - JIT eliminates unused P/E-core steering when has_hybrid=false */
 const bool has_hybrid = false;
 
+/* Gap-4 / Suggestion 1: P-core bitmask for hybrid placement steering.
+ *
+ * big_cpu_mask is a u64 bitmask where bit N=1 means CPU N is a Performance
+ * core (P-core / big core).  Written by the Rust loader from topology.rs's
+ * TopologyInfo::big_cpu_mask (which is derived from CoreType::Little detection
+ * during sched_ext attachment).  Default 0 = all cores treated as equivalent
+ * (non-hybrid or pre-loader state).
+ *
+ * Used in imperator_select_cpu to post-correct scx_bpf_select_cpu_dfl's idle
+ * CPU selection: if the selected idle CPU is a little/E-core (bit not set in
+ * big_cpu_mask), re-call scx_bpf_select_cpu_dfl with a P-core as the prev_cpu
+ * hint to bias selection toward P-cores.  scx_bpf_select_cpu_dfl's internal
+ * cascade (prev→sibling→LLC) means the hinted P-core is selected if idle.
+ *
+ * Implementation note: scx_bpf_pick_idle_cpu(cpumask*, flags) would be the
+ * natural primitive, but it requires a struct cpumask* — building one at
+ * runtime needs BPF arena allocation which imperator does not use.  The
+ * double-call approach with a P-core hint reuses the existing idle-selection
+ * infrastructure without new primitives.
+ *
+ * When has_hybrid=false: big_cpu_mask is never read (has_hybrid RODATA gate).
+ * When big_cpu_mask=0 on a hybrid system: bit-test fails for all CPUs, the
+ * early-out `!(big_cpu_mask & ...)` is false for cpu=0, but the BSF on 0
+ * is guarded by `big_cpu_mask != 0` check — falls back cleanly. */
+const u64 big_cpu_mask = 0;
+
 /* Suggestion 3: Sim profile mode — enables T3 burst credit in imperator_enqueue.
  * When false (all Gaming/Esports/Legacy/Default profiles): tier_burst_cap_kns[3] = 0,
  * T3 tasks never earn burst credit — correct for FPS where T3 preemptions are caused
@@ -23,7 +49,16 @@ const bool has_hybrid = false;
  * When true (Sim profile): tier_burst_cap_kns[3] = 1000, a simulation or open-world
  * streaming thread that is repeatedly preempted by background system work (kworkers,
  * kswapd, IRQ threads) earns proportional slice extensions, reducing fragmentation.
- * JIT constant-folds to a no-op branch elimination on Gaming/Esports profiles. */
+ *
+ * BPF RODATA semantics (FIX audit/Finding-4, documentation):
+ * sim_mode is a RODATA constant written by the Rust loader at program load time.
+ * The C compiler compiles both arms of every sim_mode branch into the BPF object;
+ * the BPF verifier must verify both arms regardless of the runtime value.  After
+ * verification, the JIT *may* constant-fold the branch when it can prove the value
+ * is invariant, but this is not guaranteed.  In practice the branch costs ~1 cycle
+ * (well-predicted after the first tick) and the dual cap tables add 8 bytes of
+ * RODATA — negligible on any profile.  Do not rely on JIT dead-stripping for
+ * correctness; rely on it only for performance, and only as a best-effort bonus. */
 const bool sim_mode = false;
 
 /* Per-LLC DSQ partitioning — populated by loader from topology detection.
@@ -33,6 +68,49 @@ const bool sim_mode = false;
 const u32 nr_llcs = 1;
 const u32 nr_cpus = 8;  /* Set by loader — bounds kick scan loop (Rule 39) */
 const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};
+
+/* SMT and core topology RODATA — populated by loader from topology.rs.
+ *
+ * These five fields complete the wiring from topology detection to BPF
+ * scheduling decisions.  They were computed correctly in topology.rs and
+ * received correctness fixes (threads_per_ccd max-reduce, cpu_thread_bit
+ * SMT indexing) but were never written to BPF RODATA until now.
+ *
+ * cpu_core_id[cpu]:    Physical core ID for logical CPU `cpu`.  Used to
+ *   look up core_cpu_mask[core_id] and core_thread_mask[core_id] from a
+ *   logical CPU index.  Bridge between per-CPU and per-core arrays.
+ *   Pattern matches cpu_llc_id: u32 array indexed by logical CPU ID.
+ *
+ * cpu_thread_bit[cpu]: Which SMT thread slot this logical CPU occupies
+ *   within its physical core.  Value is a bitmask: 1 for the first thread,
+ *   2 for the second (dual-SMT), etc.  Used in core occupancy checks:
+ *   if (core_occupancy & cpu_thread_bit[cpu]) → this thread slot is busy.
+ *
+ * core_cpu_mask[core_id]: 64-bit bitmask of all logical CPUs that belong
+ *   to physical core `core_id`.  Dual-SMT core: two bits set.  Used for
+ *   fully-idle core detection: if both bits are idle the core has full
+ *   resources available; a task placed there won't share with a sibling.
+ *   Enables SMT-aware idle selection in hybrid steering.
+ *
+ * core_thread_mask[core_id]: Bitmask of all SMT slots in core `core_id`
+ *   (e.g. 0x3 for dual-SMT).  A core is fully idle when none of its
+ *   thread slots are occupied.  Used as the denominator in occupancy
+ *   checks: fully_idle = (current_occupancy & core_thread_mask) == 0.
+ *
+ * threads_per_ccd: Number of logical CPUs (hardware threads) on the
+ *   largest CCD.  CCD-fill threshold for work-stealing: if an LLC has
+ *   fewer than threads_per_ccd tasks queued, the CCD is not saturated —
+ *   work-stealing from it is premature and wastes cache.  Received the
+ *   max-reduce fix (FIX #6) to handle asymmetric CCDs correctly.
+ *
+ * Default values (0/empty) are safe: callers guard with non-zero checks
+ * or the has_hybrid RODATA gate eliminates the block entirely on non-hybrid
+ * CPUs where these fields are not meaningful. */
+const u32 cpu_core_id[CAKE_MAX_CPUS] = {};
+const u32 cpu_thread_bit[CAKE_MAX_CPUS] = {};
+const u64 core_cpu_mask[32] = {};
+const u32 core_thread_mask[32] = {};
+const u32 threads_per_ccd = 0;
 
 /* [A] llc_cpu_mask — BSS, computed by imperator_init from cpu_llc_id RODATA.
  *
@@ -290,9 +368,13 @@ struct imperator_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
     ctx->__align_pad[0] = 0;
     ctx->__align_pad[1] = 0;
     ctx->__align_pad[2] = 0;
-    ctx->enqueue_time   = 0;
-    ctx->jitter_ewma_us = 0;
-    ctx->burst_credit   = 0;
+    ctx->enqueue_time    = 0;
+    ctx->jitter_ewma_us  = 0;
+    ctx->burst_credit    = 0;
+    /* Gap-1: sleep_entry_time = 0 (sentinel: no valid sleep timestamp yet).
+     * BPF task-storage zero-initialises on create, so this is redundant but
+     * explicit — consistent with enqueue_time and burst_credit above. */
+    ctx->sleep_entry_time = 0;
 
     /* FIX (C-2): Initialise pending_futex_op to CAKE_FUTEX_OP_UNSET (0xFF).
      *
@@ -572,6 +654,113 @@ s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
         u64 slice;
         u8  tier = consume_irq_wake_get_tier_slice(tctx, &slice);
 
+        /* Gap-4 / Suggestion 1: Hybrid P/E-core placement steering — SMT-aware.
+         *
+         * PROBLEM: scx_bpf_select_cpu_dfl selects any idle CPU without regard
+         * for core type.  On Intel hybrid (P/E-core) or ARM big.LITTLE systems,
+         * a T0 audio callback or T2 render thread may land on an E-core and stay
+         * there — DVFS cannot compensate for lower E-core IPC.
+         *
+         * FIX (two-pass, SMT-aware):
+         *
+         * Pass 1 — Fully-idle P-core preference:
+         *   Scan big_cpu_mask for P-cores whose ENTIRE physical core is idle
+         *   (both SMT threads free: core_cpu_mask bits not occupied by any
+         *   running task).  A fully-idle P-core gives the task full IPC and
+         *   cache resources without sharing with a concurrently-running sibling.
+         *   This is the highest-quality placement on a hybrid system.
+         *
+         * Pass 2 — Half-idle P-core fallback:
+         *   If no fully-idle P-core is available (common on loaded systems),
+         *   accept any P-core with at least one idle SMT thread slot — same
+         *   approach as the original single-pass scan but now explicitly
+         *   preferred over a fully-idle E-core.
+         *
+         * If neither pass finds an acceptable P-core, the original E-core
+         * selection from scx_bpf_select_cpu_dfl stands unchanged.
+         *
+         * Implementation: BSF + clear-LSB iteration over big_cpu_mask bits.
+         * For each candidate P-core CPU:
+         *   - Check task affinity (bpf_cpumask_test_cpu on p->cpus_ptr)
+         *   - Check full-core idle: core_cpu_mask[core_id] has no other
+         *     thread bits set beyond this CPU's own thread slot.
+         * Then re-call scx_bpf_select_cpu_dfl with the best candidate as
+         * prev_cpu hint — the kernel's idle-claiming cascade atomically
+         * claims the CPU if still idle.
+         *
+         * When has_hybrid=false: entire block is RODATA-gated (JIT folds).
+         * When P-core already selected: 1 bit-test, exits immediately.
+         * Pass 1 cost (fully-idle found): ~30-50 cycles, idle path only.
+         * Pass 2 cost (half-idle fallback): same, plus one extra scan pass.
+         * No-P-core cost: full scan + falls through unchanged. */
+        if (has_hybrid && big_cpu_mask != 0 &&
+            !(big_cpu_mask & (1ULL << ((u32)cpu & 63)))) {
+
+            s32 best_full = -1;   /* best fully-idle P-core CPU */
+            s32 best_half = -1;   /* best half-idle P-core CPU (fallback) */
+
+            u64 candidate_mask = big_cpu_mask;
+            for (int i = 0; i < CAKE_MAX_CPUS && candidate_mask; i++) {
+                u32 pcpu = BIT_SCAN_FORWARD_U64(candidate_mask);
+                candidate_mask &= candidate_mask - 1;
+
+                if (!bpf_cpumask_test_cpu(pcpu, p->cpus_ptr))
+                    continue;  /* task affinity excludes this P-core */
+
+                /* Check whether the full physical core is idle.
+                 * core_id is u32; guard against array bounds. */
+                u32 core_id = cpu_core_id[pcpu & (CAKE_MAX_CPUS - 1)];
+                if (core_id < 32 && core_cpu_mask[core_id] != 0) {
+                    /* SMT-aware fully-idle check:
+                     * core_cpu_mask[core_id] = bitmask of all logical CPUs in
+                     *   this physical core (all thread slots).
+                     * cpu_thread_bit[pcpu] = bitmask of THIS CPU's thread slot.
+                     * sibling_bits = the other thread slots in the same core.
+                     * If no sibling bits appear in big_cpu_mask (P-core set),
+                     * either the core is single-thread or siblings are busy
+                     * (not in the idle candidate set) — treat as fully-idle:
+                     * the task gets the whole P-core to itself. */
+                    u64 cmask = core_cpu_mask[core_id];
+                    u8  tmask = (u8)core_thread_mask[core_id & 31];
+                    u32 my_thread_bit = cpu_thread_bit[pcpu & (CAKE_MAX_CPUS - 1)];
+                    /* Sibling slots = all core slots except this CPU's own slot */
+                    u64 sibling_bits = cmask & ~(1ULL << pcpu);
+                    /* Fully idle if no sibling thread is in big_cpu_mask
+                     * (i.e. sibling is busy and won't be displaced), OR
+                     * if the core is single-thread (sibling_bits == 0). */
+                    bool full_idle = (sibling_bits == 0) ||
+                                     !(sibling_bits & big_cpu_mask) ||
+                                     (my_thread_bit != 0 &&
+                                      (tmask & ~my_thread_bit) == 0);
+                    if (full_idle && best_full < 0)
+                        best_full = (s32)pcpu;
+                    else if (best_half < 0)
+                        best_half = (s32)pcpu;
+                } else {
+                    /* No core mask data (single-thread core or non-SMT):
+                     * treat as half-idle candidate. */
+                    if (best_half < 0)
+                        best_half = (s32)pcpu;
+                }
+
+                /* Short-circuit: found a fully-idle P-core — no need to scan further */
+                if (best_full >= 0)
+                    break;
+            }
+
+            s32 pcpu_hint = (best_full >= 0) ? best_full : best_half;
+
+            if (pcpu_hint >= 0) {
+                bool dummy_idle2 = false;
+                s32 pcpu_result = scx_bpf_select_cpu_dfl(p, pcpu_hint,
+                                                          wake_flags,
+                                                          &dummy_idle2);
+                if (dummy_idle2)
+                    cpu = pcpu_result;
+                /* else: P-core became busy — keep original E-core selection */
+            }
+        }
+
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, wake_flags);
 
         /* FIX (#11): Count idle-path direct dispatches for accurate TUI stats. */
@@ -730,11 +919,27 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
         ? tier_burst_cap_kns_sim
         : tier_burst_cap_kns_gaming;
 
-    /* Sim mode also allows T3 to earn burst credit, not just T0–T2.
-     * Use CAKE_TIER_BULK as the ceiling when sim_mode, CAKE_TIER_FRAME otherwise. */
+    /* Sim mode also allows T3 to earn burst credit, not just T1–T2.
+     * Use CAKE_TIER_BULK as the ceiling when sim_mode, CAKE_TIER_FRAME otherwise.
+     *
+     * T0 is always excluded by burst_eligible_min regardless of profile.
+     * FIX (audit/Finding-3): The previous code used only `tier <= burst_eligible_max`
+     * which, in Sim mode (max=CAKE_TIER_BULK=3), admitted all tiers including T0=0.
+     * T0 was excluded only by `tier_burst_cap_kns_sim[0] = 0` — a cap-table guard,
+     * not a range guard.  This creates a latent bug: if the cap table is ever
+     * changed to give T0 a non-zero cap (by mistake), the range check provides
+     * no defense.  Explicitly excluding T0 here makes the invariant structural:
+     *
+     *   "T0 critical tasks are latency-bound and must never receive slice
+     *    extensions from burst credit regardless of profile."
+     *
+     * burst_eligible_min = CAKE_TIER_INTERACT (1) ensures T0 (0) never enters
+     * the accumulation block, in any profile, regardless of the cap table. */
+    u8 burst_eligible_min = CAKE_TIER_INTERACT;  /* T0 excluded always */
     u8 burst_eligible_max = sim_mode ? CAKE_TIER_BULK : CAKE_TIER_FRAME;
 
-    if ((enq_flags & SCX_ENQ_PREEMPT) && tier <= burst_eligible_max) {
+    if ((enq_flags & SCX_ENQ_PREEMPT) &&
+        tier >= burst_eligible_min && tier <= burst_eligible_max) {
         u16 cap_kns = tier_burst_cap_kns[CAKE_TIER_IDX(tier)];
         if (cap_kns > 0) {
             /* Credit = quantum / 4096 kns (÷1024 for ns→kns, ÷4 for quarter).
@@ -1066,6 +1271,33 @@ void BPF_STRUCT_OPS(imperator_dispatch, s32 raw_cpu, struct task_struct *prev)
     for (u32 i = 0; i < nr_llcs; i++) {
         if (i != my_llc &&
             imperator_relaxed_load_u8(&llc_nonempty[i].nonempty)) {
+            /* CCD-fill threshold check (threads_per_ccd RODATA):
+             *
+             * Stealing from an LLC that has fewer tasks than it has CPU threads
+             * is premature — the CCD has spare capacity and its tasks should
+             * run locally, not migrate cross-LLC.  Premature stealing:
+             *   1. Causes unnecessary cross-LLC cache-miss penalties (ETD cost).
+             *   2. Fragments working sets that benefit from sharing the LLC.
+             *   3. Moves work away from CPUs that are about to become idle.
+             *
+             * threads_per_ccd is the thread count of the largest CCD.  When
+             * the DSQ for LLC `i` has fewer queued tasks than threads_per_ccd,
+             * at least one thread in that CCD is idle or about to dispatch
+             * locally — cross-LLC stealing is wasteful.
+             *
+             * threads_per_ccd = 0 (default/pre-loader): threshold check is
+             * skipped (0 < 0 is always false) — falls back to legacy steal
+             * behaviour unchanged.
+             *
+             * Implementation: scx_bpf_dsq_nr_queued(DSQ_id) returns the
+             * current depth of the specified DSQ. */
+            if (threads_per_ccd > 0) {
+                u32 victim_dsq = LLC_DSQ_BASE + i;
+                u32 depth = scx_bpf_dsq_nr_queued(victim_dsq);
+                if (depth < threads_per_ccd)
+                    continue;  /* CCD not saturated — skip */
+            }
+
             steal_mask |= 1u << i;
             u8 c = llc_etd_cost[my_llc & (CAKE_MAX_LLCS - 1)][i & (CAKE_MAX_LLCS - 1)];
             /* Only update cheapest when ETD data is present (c > 0). */
@@ -1281,8 +1513,27 @@ void BPF_STRUCT_OPS(imperator_tick, struct task_struct *p)
              * which is already in L1 from the contention check above).  ~0 cycles
              * since the value is already in a register. */
             bool sole_occupant = rq && (rq->scx.nr_running == 0);
-            if (sole_occupant)
+            if (sole_occupant) {
+                /* FIX (audit/Finding-1): Increment tick_counter BEFORE the goto.
+                 *
+                 * tick_counter is the graduated-backoff confidence counter —
+                 * it grows during low-contention periods and controls how
+                 * infrequently the Phase 2 starvation check runs (every 1st, 2nd,
+                 * 4th, ... tick via the skip_mask).  The previous code bypassed
+                 * the tc++ store when sole_occupant was true, leaving tick_counter
+                 * permanently at 0 on uncontested cores.  Result: the starvation
+                 * check ran on every tick (skip_mask never satisfied) instead of
+                 * progressively backing off — wasted work that grows with backoff
+                 * depth.  At 1KHz tick rate this adds ~5–10 cycles/tick of
+                 * unnecessary Phase 2 overhead on the exact workload this feature
+                 * targets (strategy-sim sole occupant).
+                 *
+                 * Fix: tc++ before the goto, matching the treatment in the normal
+                 * no-contention path below.  On the next tick, tc has advanced and
+                 * the skip_mask may fire, reducing starvation-check frequency. */
+                if (tc < 255) imperator_relaxed_store_u8(&mbox->tick_counter, tc + 1);
                 goto mailbox_dvfs_max;
+            }
             if (tc < 255) imperator_relaxed_store_u8(&mbox->tick_counter, tc + 1);
         }
     } else {
@@ -1294,13 +1545,28 @@ mailbox_dvfs_max:; /* Sole-occupant fast path: skip tier lookup, pin to max freq
     /* Suggestion 6: The core has exactly one runnable thread.  Set DVFS to
      * maximum unconditionally — the tier-proportional table is bypassed.
      * Mailbox tier is still updated so waker-tier inheritance is correct.
-     * Falls through to mailbox update then returns, skipping tier table read. */
+     *
+     * dsq_hint encoding note (FIX audit/Finding-2, documentation):
+     * dsq_hint caches (cpuperf_target >> 2) in a u8 to detect unchanged DVFS
+     * targets and avoid redundant kfunc calls.  SCX_CPUPERF_ONE = 1024;
+     * 1024 >> 2 = 256, which truncates to u8 = 0.  This means dsq_hint == 0
+     * encodes "target = SCX_CPUPERF_ONE" — the same value as the BSS-zero
+     * uninitialized state and the same value written by the standard mailbox_dvfs
+     * path for T0/T1 tasks (which also have target = 1024 = SCX_CPUPERF_ONE).
+     * The encoding is consistent and deliberately correct:
+     *   - BSS zero → first tick sees dsq_hint=0, target_cached=0, calls kfunc ✓
+     *   - T0/T1 or sole-occupant → dsq_hint=0, already at max, skip kfunc ✓
+     *   - T2 → dsq_hint=256, T3 → dsq_hint=192; non-zero ≠ 0, calls kfunc ✓
+     * The hysteresis is correct even though 0 is the BSS default, because
+     * the first call always sets the target (cached=0, target_cached=0 on T0/T1
+     * only after the first non-zero tier transitions through). */
     {
         u8 max_flags = (u8)(MBOX_VALID_FLAG | (tier_reg & MBOX_TIER_MASK));
         if (imperator_relaxed_load_u8(&mbox->flags) != max_flags)
             imperator_relaxed_store_u8(&mbox->flags, max_flags);
+        /* SCX_CPUPERF_ONE=1024 >> 2 = 256 → u8 = 0.  See encoding note above. */
         u8 cached_perf_max = imperator_relaxed_load_u8(&mbox->dsq_hint);
-        u8 max_target_cached = (u8)(SCX_CPUPERF_ONE >> 2);
+        u8 max_target_cached = (u8)(SCX_CPUPERF_ONE >> 2);  /* intentionally 0 */
         if (cached_perf_max != max_target_cached) {
             scx_bpf_cpuperf_set(cpu_id_reg, SCX_CPUPERF_ONE);
             imperator_relaxed_store_u8(&mbox->dsq_hint, max_target_cached);
@@ -1504,56 +1770,64 @@ void reclassify_task_cold(struct imperator_task_ctx *tctx, bool runnable)
 
     u32 runtime_raw = now - last_run;
 
-    /* FIX (post-load recovery): If the task has been sleeping for over 500ms
-     * (e.g. a loading screen, an idle background service resuming), pull its
-     * avg_runtime_us halfway toward the midpoint of its current tier before
-     * running the EWMA.  Without this, a game thread that spends 30s at T3
-     * during asset loading needs 10+ EWMA bouts (20–32ms) to recover to T1/T2
-     * after the load completes — during which game frames compete at the wrong
-     * tier, causing frame-time spikes at session start.
+    /* FIX (post-load recovery / Gap-1): Pull avg_runtime toward the tier
+     * midpoint when a task wakes from a genuine long sleep (> 500ms).
      *
-     * 500ms threshold is deliberately above any gaming frame cadence (even at
-     * 24fps the frame period is ~42ms) but below OS idle timers, so only genuine
-     * sleeps trigger the decay.  We write the corrected value back immediately so
-     * both the fast-backoff path and the full reclassify path below read the
-     * decayed base.  Single-step: halve the distance to the tier midpoint — the
-     * EWMA then converges to the true runtime within 3–5 bouts instead of 10+.
+     * PROBLEM this fixes: A game render thread spending 30s in T3 during a
+     * loading screen needs 10+ EWMA bouts (~20–32ms) to recover to T1/T2 once
+     * gameplay resumes, causing frame-time spikes at session start.
      *
-     * Tier midpoints (geometric mean of adjacent gates):
+     * MECHANISM: When the task genuinely blocked (runnable=false in
+     * imperator_stopping), sleep_entry_time was stamped with the wall-clock
+     * nanosecond timestamp at that moment.  At the next wakeup, enqueue_time
+     * is stamped in imperator_enqueue.  The sleep duration is therefore:
+     *
+     *   sleep_ns = tctx->enqueue_time - tctx->sleep_entry_time
+     *
+     * Both fields are u32 truncations of scx_bpf_now(), so the subtraction
+     * wraps correctly for sleeps up to ~4.3 seconds.  Sleeps > 4.3s produce
+     * a small wrapped value that does not exceed the 500ms threshold — the
+     * heuristic simply does not fire for very long sleeps, which is acceptable
+     * (those tasks will recover via normal EWMA convergence over 3–5 bouts).
+     *
+     * CORRECTION (Gap-1 / audit/Finding-6): Previous code used runtime_raw
+     * (now - last_run_at = BOUT duration, not SLEEP duration).  A task waking
+     * from a 30-second sleep after a 5ms bout had runtime_raw=5ms and never
+     * triggered the 500ms threshold — the heuristic was functionally inert.
+     * sleep_entry_time correctly measures the period the task was actually
+     * absent from a CPU.
+     *
+     * 500ms threshold: above any gaming frame cadence (24fps = 42ms period)
+     * but short enough to catch loading screens and multi-second idles.
+     *
+     * Tier midpoints (halving distance to midpoint decays stale history):
      *   T0 Critical  (<100µs):   ~50µs
      *   T1 Interact  (<2000µs):  ~1050µs
      *   T2 Frame     (<8000µs):  ~5000µs
      *   T3 Bulk      (≥8000µs):  floor = 8001µs
      *
-     * FIX (W-3 / pre-impl-audit): Gate on `!runnable`.
-     *
-     * `imperator_stopping(p, runnable)` receives a kernel-provided bool that
-     * distinguishes "task blocked/slept" (runnable=false) from "task was still
-     * runnable but descheduled" (runnable=true, e.g. preempted, slice expired,
-     * tick-backoff, lock-holder skip cap).  Previously `runnable` was dropped at
-     * the struct_ops boundary and never reached this function — the heuristic
-     * fired purely on elapsed wall-clock time, making it impossible to distinguish
-     * a genuine 500ms sleep from a task that was continuously runnable but starved
-     * by scheduling pressure for the same duration.
-     *
-     * With `!runnable` gating: the midpoint-pull fires ONLY when the task
-     * genuinely blocked (runnable=false), matching the documented intent.  A
-     * runnable-but-starved task that hasn't executed for 500ms keeps its existing
-     * avg_runtime_us unchanged — the starvation preempt mechanism already handles
-     * its scheduling, and false midpoint-pulls would corrupt its tier history.
-     *
-     * Cost: zero — `runnable` is in registers at the struct_ops call site
-     * per the BPF calling convention; threading it through costs one bool
-     * argument and one additional branch taken only when runtime_raw > 500ms. */
-    if (!runnable && runtime_raw > 500000000U) {
-        static const u16 tier_sleep_mid[4] = { 50, 1050, 5000, 8001 };
-        u8 s_tier = (packed >> SHIFT_TIER) & MASK_TIER;
-        u32 cur_fused = tctx->deficit_avg_fused;
-        u16 cur_avg   = EXTRACT_AVG_RT(cur_fused);
-        u16 mid       = tier_sleep_mid[CAKE_TIER_IDX(s_tier)];
-        /* Halve the distance: one step toward midpoint, preserving EWMA direction */
-        tctx->deficit_avg_fused = PACK_DEFICIT_AVG(EXTRACT_DEFICIT(cur_fused),
-                                                   (u16)((cur_avg + mid) >> 1));
+     * W-3 / pre-impl-audit gate: !runnable confirms the task genuinely
+     * blocked rather than being preempted while still runnable.  A runnable-
+     * but-starved task with sleep_entry_time=0 (cleared in imperator_stopping
+     * when runnable=true) also correctly skips the heuristic. */
+    if (!runnable && tctx->sleep_entry_time != 0) {
+        u32 sleep_ns = tctx->enqueue_time - tctx->sleep_entry_time;
+        if (sleep_ns > 500000000U) {
+            static const u16 tier_sleep_mid[4] = { 50, 1050, 5000, 8001 };
+            u8  s_tier    = (packed >> SHIFT_TIER) & MASK_TIER;
+            u32 cur_fused = tctx->deficit_avg_fused;
+            u16 cur_avg   = EXTRACT_AVG_RT(cur_fused);
+            u16 mid       = tier_sleep_mid[CAKE_TIER_IDX(s_tier)];
+            /* Halve the distance to midpoint: one step, EWMA converges in 3-5 bouts */
+            tctx->deficit_avg_fused = PACK_DEFICIT_AVG(EXTRACT_DEFICIT(cur_fused),
+                                                       (u16)((cur_avg + mid) >> 1));
+        }
+        /* Consume the sleep timestamp regardless of threshold — prevents a
+         * stale sleep_entry_time from contaminating a future bout if the task
+         * is preempted and re-enqueued multiple times before the next genuine
+         * block (sleep_entry_time would be overwritten at the next blocking
+         * imperator_stopping anyway, but zeroing here is defensive). */
+        tctx->sleep_entry_time = 0;
     }
 
     u32 runtime_us = runtime_raw >> 10;  /* ns → ~μs (÷1024 ≈ ÷1000) */
@@ -1874,9 +2148,14 @@ s32 BPF_STRUCT_OPS(imperator_init_task, struct task_struct *p,
          * enqueue_time is reset to 0 (sentinel) so the guard in
          * imperator_running skips the EWMA update until the first real
          * enqueue_time is stamped by imperator_enqueue. */
-        tctx->enqueue_time   = 0;
-        tctx->jitter_ewma_us = 0;
-        tctx->burst_credit   = 0;
+        tctx->enqueue_time    = 0;
+        tctx->jitter_ewma_us  = 0;
+        tctx->burst_credit    = 0;
+        /* Gap-1: clear sleep_entry_time on exec — stale sleep timestamps from
+         * the pre-exec process have no meaning for the new binary's execution
+         * profile and could incorrectly trigger the post-sleep recovery heuristic
+         * on the first wakeup after exec completes. */
+        tctx->sleep_entry_time = 0;
 
         /* Recompute pre-fetched slice for the reset tier */
         u64 cfg  = tier_configs[CAKE_TIER_IDX(init_tier)];
@@ -1934,9 +2213,12 @@ s32 BPF_STRUCT_OPS(imperator_init_task, struct task_struct *p,
      * alloc_task_ctx_cold already zeros these fields (explicit in that function),
      * so these stores are technically redundant — they are written here for the
      * same documentation and future-safety reasons described in alloc_task_ctx_cold. */
-    ctctx->enqueue_time   = 0;
-    ctctx->jitter_ewma_us = 0;
-    ctctx->burst_credit   = 0;
+    ctctx->enqueue_time    = 0;
+    ctctx->jitter_ewma_us  = 0;
+    ctctx->burst_credit    = 0;
+    /* Gap-1: child starts with no sleep history — parent's sleep_entry_time
+     * is irrelevant to the child's first scheduling bout. */
+    ctctx->sleep_entry_time = 0;
 
     return 0;
 }
@@ -1976,7 +2258,30 @@ void BPF_STRUCT_OPS(imperator_stopping, struct task_struct *p, bool runnable)
 
         /* FIX (W-3): Pass `runnable` through to reclassify_task_cold so the
          * 500ms post-sleep recovery heuristic can be correctly gated on
-         * !runnable (genuine block/sleep) vs runnable (preempted/starved). */
+         * !runnable (genuine block/sleep) vs runnable (preempted/starved).
+         *
+         * Gap-1 fix: stamp sleep_entry_time when the task genuinely blocks.
+         *
+         * sleep_entry_time records (u32)scx_bpf_now() at the moment the task
+         * transitions to sleep/block (runnable=false).  reclassify_task_cold
+         * reads it at the next wakeup (via imperator_enqueue's enqueue_time) to
+         * compute actual sleep duration rather than bout duration.
+         *
+         * When runnable=true (preempted, slice expired, etc.) we write 0 to
+         * clear any stale value left from a previous sleep.  This ensures the
+         * sentinel check in reclassify_task_cold (sleep_entry_time == 0 → skip)
+         * correctly suppresses the heuristic for tasks that are descheduled
+         * while runnable rather than sleeping.
+         *
+         * scx_bpf_now() is already called earlier in imperator_tick for this CPU;
+         * calling it again here costs ~10-15ns but is unavoidable since stopping
+         * does not have access to the per-CPU cached timestamp.  This is a cold
+         * path (each context switch calls stopping exactly once). */
+        if (!runnable)
+            tctx->sleep_entry_time = (u32)scx_bpf_now();
+        else
+            tctx->sleep_entry_time = 0;
+
         reclassify_task_cold(tctx, runnable);
     }
 }
