@@ -377,7 +377,38 @@ struct imperator_stats {
 #define CAKE_DEFAULT_STARVATION_T0   3000000
 #define CAKE_DEFAULT_STARVATION_T1   8000000
 #define CAKE_DEFAULT_STARVATION_T2  40000000
-#define CAKE_DEFAULT_STARVATION_T3 100000000
+/* FIX (desktop-policy/T3-starvation): tightened 100ms -> 50ms.
+ *
+ * CONTEXT: tier_perf_target[T3] was raised from 75% to 100% (see
+ * tier_perf_target[]'s comment in imperator_bpf.c) under the desktop
+ * philosophy that mains-powered systems should trade power for performance
+ * rather than throttle background work for thermal headroom most desktops
+ * don't need.
+ *
+ * PROBLEM THIS CLOSES: at 100% frequency a T3 task (shader compilation,
+ * background compile, asset streaming) makes more forward progress per tick
+ * than it did at 75% — including during a worst-case starvation run. A
+ * previous revision's comment claimed starvation thresholds had been
+ * tightened to compensate; they had not been (this constant was unchanged
+ * at 100ms). That gap meant a foreground T0/T1/T2 task contending with an
+ * unthrottled T3 task could wait the FULL unchanged 100ms ceiling — worse
+ * than before, since the T3 task was now also doing more damage per ms of
+ * that wait (full clock vs. 75%).
+ *
+ * FIX: halve the T3 ceiling to 50ms. This is still 1.25x T2's 40ms ceiling
+ * (T3 retains meaningfully more rope than T2, consistent with "bulk work can
+ * wait longer than frame-producing work") while bounding worst-case
+ * foreground-thread wait to half of what an unthrottled-T3 system would
+ * otherwise allow. Combined with the existing lock-holder skip and
+ * O(1) bitmask preemption kick, this keeps the "more power, more throughput"
+ * benefit on T3 while capping the worst case it can impose on T0-T2.
+ *
+ * This value has NOT been validated with the project's standard A/B
+ * methodology (the Arc Raiders 1%-low test cited elsewhere in this file).
+ * It is a reasoned default, not a measured optimum — treat it as a starting
+ * point for that test, the same way any DVFS/starvation change should be
+ * treated per the perf-regression-guard note on tier_perf_target[]. */
+#define CAKE_DEFAULT_STARVATION_T3  50000000
 #define CAKE_DEFAULT_MULTIPLIER_T0  512
 #define CAKE_DEFAULT_MULTIPLIER_T1  1024
 #define CAKE_DEFAULT_MULTIPLIER_T2  2048

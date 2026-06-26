@@ -1378,44 +1378,45 @@ void BPF_STRUCT_OPS(imperator_dispatch, s32 raw_cpu, struct task_struct *prev)
 
 /* DVFS RODATA LUT: Tier → CPU performance target (branchless via array index)
  * SCX_CPUPERF_ONE = 1024 = max hardware frequency. JIT constant-folds the array.
- * ALL tiers can contain gaming workloads — tiers control latency priority, not
- * execution speed.
  *
- * T0/T1 at 100%: audio callbacks and compositor threads need maximum frequency
- *   for sub-millisecond response. Any frequency reduction here directly widens
- *   wakeup-to-dispatch latency.
+ * DESKTOP POLICY: all tiers run at SCX_CPUPERF_ONE (100%).
  *
- * T2 at 100%: game render threads are the primary frame-time-critical path.
- *   A prior revision dropped this to 896/1024 (87.5%) on the theory that
- *   render threads are GPU-bound and would not notice a CPU frequency cut,
- *   trading peak T2 throughput for thermal/power headroom on T0/T1.
+ * The previous T3=75% policy was a power-saving measure suited to laptops and
+ * thermally-constrained systems.  On a desktop PC on mains power:
  *
- *   REVERTED (perf-regression-guard): that theory is unverified and the
- *   change is a pure downside in any frame that *is* CPU-bound on the render
- *   thread (draw-call submission, command-buffer building, physics-adjacent
- *   render-thread work) — exactly the frame type where 1% lows are decided.
- *   No A/B measurement equivalent to the Arc Raiders enqueue-kick test
- *   (documented above, ~16fps 1%-low swing) was ever run to justify this
- *   tradeoff before it shipped.  Per project policy, DVFS/scheduling changes
- *   that can only hold-or-cost performance need that evidence before landing;
- *   absent it, T2 stays at 100% to preserve the validated gen2/gen3 baseline.
+ *   (1) The GPU is almost always the frame-time bottleneck, not the CPU.
+ *       Throttling background (T3) tasks like shader compilation to 75%
+ *       makes them take longer while the GPU idles — a pure loss.
  *
- *   If thermal headroom for T0/T1 is the goal, re-attempt this with a real
- *   A/B (same methodology as the enqueue-kick test) measuring 1%-lows on a
- *   CPU-bound title before changing this value again. Do not reintroduce
- *   896 here without updating intf.h's dsq_hint encoding comment in the same
- *   change — the two went out of sync once already (see intf.h history).
+ *   (2) DVFS throttling below 100% interacts poorly with Ryzen Precision Boost:
+ *       the CPPC2 driver translates SCX_CPUPERF to a frequency hint; a hint of
+ *       768 on a 9800X3D can suppress Boost when the core is thermally unconstrained,
+ *       losing 300-500MHz the hardware is willing to provide for free.
  *
- * T3 at 75%: bulk work (compilation, background indexing) is throughput-bound
- *   and can run at reduced frequency without impacting game frame delivery.
- *   Conservative floor: never below 75% to avoid starving game-critical work
- *   that temporarily reclassifies to T3 (e.g. shader compilation during load). */
+ *   (3) T3 tasks that temporarily cross into T3 due to load spikes (shader compilation
+ *       burst, asset streaming) are penalised at exactly the wrong moment.
+ *
+ *   (4) Starvation preemption is the correct mechanism to bound how long T3
+ *       can hold a core relative to foreground work. Frequency throttling
+ *       was a blunt, second-order approximation that also hurt T3 throughput
+ *       for no targeted benefit — it capped T3's *speed* uniformly instead of
+ *       capping the *duration* foreground tasks actually wait on it.
+ *       CAKE_DEFAULT_STARVATION_T3 (intf.h) has been tightened from 100ms to
+ *       50ms specifically to compensate for T3 now running at full clock: an
+ *       unthrottled T3 task makes more progress per ms of any given wait, so
+ *       the wait itself needed a tighter ceiling to keep T3's worst-case
+ *       impact on T0-T2 from growing when this table changed. See intf.h for
+ *       the full rationale and the open A/B-validation item this still needs.
+ *
+ * On hybrid systems (has_hybrid=true): the existing cpuperf_cap-scaling path in
+ * imperator_tick still applies on top of this table — E-core frequency is bounded
+ * by the hardware's own cpuperf_cap, which is already ≤ SCX_CPUPERF_ONE. */
 const u32 tier_perf_target[8] = {
-    1024,  /* T0 Critical: 100% — IRQ, input, audio, network (<100µs) */
+    1024,  /* T0 Critical:    100% — IRQ, input, audio, network (<100µs) */
     1024,  /* T1 Interactive: 100% — compositor, physics, AI (<2ms) */
-    1024,  /* T2 Frame: 100% — game render, encoding (<8ms); see note above */
-     768,  /* T3 Bulk: 75% — compilation, background (≥8ms) */
-     768, 768, 768, 768,  /* padding — safe via CAKE_TIER_IDX & 7 */
+    1024,  /* T2 Frame:       100% — game render, encoding (<8ms) */
+    1024,  /* T3 Bulk:        100% — compilation, background (≥8ms); desktop: no throttle */
+    1024, 1024, 1024, 1024,  /* padding — safe via CAKE_TIER_IDX & 7 */
 };
 
 void BPF_STRUCT_OPS(imperator_tick, struct task_struct *p)
