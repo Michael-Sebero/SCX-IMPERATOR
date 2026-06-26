@@ -725,9 +725,37 @@ s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
                     u32 my_thread_bit = cpu_thread_bit[pcpu & (CAKE_MAX_CPUS - 1)];
                     /* Sibling slots = all core slots except this CPU's own slot */
                     u64 sibling_bits = cmask & ~(1ULL << pcpu);
-                    /* Fully idle if no sibling thread is in big_cpu_mask
-                     * (i.e. sibling is busy and won't be displaced), OR
-                     * if the core is single-thread (sibling_bits == 0). */
+                    /* Fully-idle classification (three clauses, each sufficient):
+                     *
+                     * Clause 1: (sibling_bits == 0)
+                     *   Single-thread core (no SMT) or all siblings already
+                     *   cleared from core_cpu_mask — core is trivially alone.
+                     *
+                     * Clause 2: !(sibling_bits & big_cpu_mask)
+                     *   No sibling of this P-core appears in big_cpu_mask.
+                     *   This relies on an implicit hardware-topology invariant:
+                     *   on all current Intel hybrid (P/E-core) and ARM big.LITTLE
+                     *   designs, SMT siblings are ALWAYS the same core type —
+                     *   both threads of a P-core are P-cores, both threads of an
+                     *   E-core are E-cores.  There are no mixed-type SMT pairs.
+                     *   Therefore: if pcpu is a P-core (in big_cpu_mask) but its
+                     *   sibling is NOT in big_cpu_mask, the sibling is an E-core
+                     *   — which is impossible on real hardware.  The only way this
+                     *   clause fires in practice is if the sibling P-core is busy
+                     *   (removed from the idle candidate set we're scanning) or
+                     *   the core is non-SMT.  In both cases the candidate P-core
+                     *   effectively has the physical core to itself.
+                     *   FIX (audit/new-audit): previous code had this clause
+                     *   without explaining the hardware assumption.  If future
+                     *   hardware introduces mixed-type SMT pairs, replace this
+                     *   clause with an explicit occupancy check using
+                     *   scx_bpf_cpu_rq() → nr_running, or remove it entirely
+                     *   and rely only on clauses 1 and 3.
+                     *
+                     * Clause 3: (my_thread_bit != 0 && (tmask & ~my_thread_bit) == 0)
+                     *   core_thread_mask has only this CPU's thread bit set —
+                     *   this is a single-thread core (degenerate SMT or topology
+                     *   data shows no siblings).  Fully idle by construction. */
                     bool full_idle = (sibling_bits == 0) ||
                                      !(sibling_bits & big_cpu_mask) ||
                                      (my_thread_bit != 0 &&
@@ -982,9 +1010,27 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
     u16 bc = tctx_reg->burst_credit;
     if (bc > 0) {
         u64 bonus_ns  = (u64)bc << 10;   /* kns → ns */
-        /* Ceiling = T2 natural quantum.  CAKE_DEFAULT_MULTIPLIER_T2 = 2048,
-         * so (quantum_ns * 2048) >> 10 = 2 × quantum_ns = ~4ms at defaults. */
-        u64 max_slice = (quantum_ns * (u64)CAKE_DEFAULT_MULTIPLIER_T2) >> 10;
+        /* Ceiling = T2 natural quantum, read from the ACTIVE tier_configs entry.
+         *
+         * FIX (audit/new-audit): previous code used CAKE_DEFAULT_MULTIPLIER_T2
+         * (the compile-time default constant = 2048).  This is correct for the
+         * Gaming/Esports/Default profiles but silently diverges if any profile
+         * or future CLI override changes T2's effective multiplier in tier_configs
+         * — the ceiling would stop tracking the actual T2 quantum and either
+         * over-constrain (if multiplier increased) or under-constrain (if
+         * decreased) the burst credit extension.
+         *
+         * Fix: read UNPACK_MULTIPLIER(tier_configs[CAKE_TIER_FRAME]) to get the
+         * live multiplier that the scheduler is actually using for T2 tasks.
+         * tier_configs is RODATA, already in L1 from the starvation check above
+         * — zero additional memory traffic.  UNPACK_MULTIPLIER is a shift+mask
+         * operation (~2 cycles) on the already-loaded u64 fused config.
+         *
+         * At Gaming defaults: UNPACK_MULTIPLIER = 2048, result = 2×quantum_ns
+         * = ~4ms.  Unchanged from previous behavior at default profile. */
+        u64 t2_cfg    = tier_configs[CAKE_TIER_IDX(CAKE_TIER_FRAME)];
+        u64 t2_mult   = UNPACK_MULTIPLIER(t2_cfg);
+        u64 max_slice = (quantum_ns * t2_mult) >> 10;
         u64 ext_slice = slice + bonus_ns;
         slice = (ext_slice < max_slice) ? ext_slice : max_slice;
         tctx_reg->burst_credit = 0;
@@ -1333,14 +1379,43 @@ void BPF_STRUCT_OPS(imperator_dispatch, s32 raw_cpu, struct task_struct *prev)
 /* DVFS RODATA LUT: Tier → CPU performance target (branchless via array index)
  * SCX_CPUPERF_ONE = 1024 = max hardware frequency. JIT constant-folds the array.
  * ALL tiers can contain gaming workloads — tiers control latency priority, not
- * execution speed. Conservative targets: never below 75% to avoid starving
- * game-critical work. */
+ * execution speed.
+ *
+ * T0/T1 at 100%: audio callbacks and compositor threads need maximum frequency
+ *   for sub-millisecond response. Any frequency reduction here directly widens
+ *   wakeup-to-dispatch latency.
+ *
+ * T2 at 100%: game render threads are the primary frame-time-critical path.
+ *   A prior revision dropped this to 896/1024 (87.5%) on the theory that
+ *   render threads are GPU-bound and would not notice a CPU frequency cut,
+ *   trading peak T2 throughput for thermal/power headroom on T0/T1.
+ *
+ *   REVERTED (perf-regression-guard): that theory is unverified and the
+ *   change is a pure downside in any frame that *is* CPU-bound on the render
+ *   thread (draw-call submission, command-buffer building, physics-adjacent
+ *   render-thread work) — exactly the frame type where 1% lows are decided.
+ *   No A/B measurement equivalent to the Arc Raiders enqueue-kick test
+ *   (documented above, ~16fps 1%-low swing) was ever run to justify this
+ *   tradeoff before it shipped.  Per project policy, DVFS/scheduling changes
+ *   that can only hold-or-cost performance need that evidence before landing;
+ *   absent it, T2 stays at 100% to preserve the validated gen2/gen3 baseline.
+ *
+ *   If thermal headroom for T0/T1 is the goal, re-attempt this with a real
+ *   A/B (same methodology as the enqueue-kick test) measuring 1%-lows on a
+ *   CPU-bound title before changing this value again. Do not reintroduce
+ *   896 here without updating intf.h's dsq_hint encoding comment in the same
+ *   change — the two went out of sync once already (see intf.h history).
+ *
+ * T3 at 75%: bulk work (compilation, background indexing) is throughput-bound
+ *   and can run at reduced frequency without impacting game frame delivery.
+ *   Conservative floor: never below 75% to avoid starving game-critical work
+ *   that temporarily reclassifies to T3 (e.g. shader compilation during load). */
 const u32 tier_perf_target[8] = {
     1024,  /* T0 Critical: 100% — IRQ, input, audio, network (<100µs) */
     1024,  /* T1 Interactive: 100% — compositor, physics, AI (<2ms) */
-    1024,  /* T2 Frame: 100% — game render, encoding (<8ms) */
-    768,   /* T3 Bulk: 75% — compilation, background (≥8ms) */
-    768, 768, 768, 768,  /* padding */
+    1024,  /* T2 Frame: 100% — game render, encoding (<8ms); see note above */
+     768,  /* T3 Bulk: 75% — compilation, background (≥8ms) */
+     768, 768, 768, 768,  /* padding — safe via CAKE_TIER_IDX & 7 */
 };
 
 void BPF_STRUCT_OPS(imperator_tick, struct task_struct *p)
@@ -1552,14 +1627,14 @@ mailbox_dvfs_max:; /* Sole-occupant fast path: skip tier lookup, pin to max freq
      * 1024 >> 2 = 256, which truncates to u8 = 0.  This means dsq_hint == 0
      * encodes "target = SCX_CPUPERF_ONE" — the same value as the BSS-zero
      * uninitialized state and the same value written by the standard mailbox_dvfs
-     * path for T0/T1 tasks (which also have target = 1024 = SCX_CPUPERF_ONE).
+     * path for T0/T1/T2 tasks (which all have target = 1024 = SCX_CPUPERF_ONE).
      * The encoding is consistent and deliberately correct:
      *   - BSS zero → first tick sees dsq_hint=0, target_cached=0, calls kfunc ✓
-     *   - T0/T1 or sole-occupant → dsq_hint=0, already at max, skip kfunc ✓
-     *   - T2 → dsq_hint=256, T3 → dsq_hint=192; non-zero ≠ 0, calls kfunc ✓
+     *   - T0/T1/T2 or sole-occupant → dsq_hint=0, already at max, skip kfunc ✓
+     *   - T3 → dsq_hint=192 (768>>2); non-zero ≠ 0, calls kfunc ✓
      * The hysteresis is correct even though 0 is the BSS default, because
-     * the first call always sets the target (cached=0, target_cached=0 on T0/T1
-     * only after the first non-zero tier transitions through). */
+     * the first call always sets the target (cached=0, target_cached=0 on
+     * T0/T1/T2 only after the first non-zero tier transitions through). */
     {
         u8 max_flags = (u8)(MBOX_VALID_FLAG | (tier_reg & MBOX_TIER_MASK));
         if (imperator_relaxed_load_u8(&mbox->flags) != max_flags)

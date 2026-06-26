@@ -304,16 +304,23 @@ struct mega_mailbox_entry {
      * Encoding (audit/Finding-2): stores (cpuperf_target >> 2) as u8.
      * cpuperf_target range [0, SCX_CPUPERF_ONE=1024].
      *   T3 Gaming  → target=768  → dsq_hint=192
-     *   T2 Gaming  → target=896  → dsq_hint=224
-     *   T0/T1      → target=1024 → dsq_hint=256 → u8=0  (wraps)
+     *   T0/T1/T2   → target=1024 → dsq_hint=256 → u8=0  (wraps)
      *   Sole-occ.  → target=1024 → dsq_hint=256 → u8=0  (same wrap, correct)
-     *   BSS zero   → dsq_hint=0  (same as T0/T1 — first tick always calls kfunc
+     *   BSS zero   → dsq_hint=0  (same as T0/T1/T2 — first tick always calls kfunc
      *                              because target_cached is also 0 on first read,
      *                              but the kfunc call is idempotent so this is safe)
      *
      * The 0 encoding for SCX_CPUPERF_ONE is deliberate: any transition TO max
      * frequency sets dsq_hint=0; subsequent ticks see cached==target==0 and skip
-     * the kfunc call.  The encoding is consistent across all paths that write it. */
+     * the kfunc call.  The encoding is consistent across all paths that write it.
+     *
+     * NOTE (perf-regression-guard): an earlier revision of this comment
+     * documented a planned T2 target of 896 (dsq_hint=224) that was never
+     * applied to tier_perf_target[] in imperator_bpf.c, and a later revision
+     * applied it without supporting A/B evidence. T2 has been reverted to
+     * 1024 to match the validated baseline — see tier_perf_target[]'s comment
+     * in imperator_bpf.c for the full rationale. If T2 DVFS tuning is
+     * revisited, update both this comment and the table in the same change. */
     u8 dsq_hint;
     u8 tick_counter;
     u8 __reserved[61];
