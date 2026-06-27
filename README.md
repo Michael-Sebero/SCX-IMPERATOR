@@ -144,7 +144,7 @@ The signal resets on exec and fork, and is skipped for tasks dispatched via the 
 
 T1 (Interactive) and T2 (Frame) tasks that are preempted before completing their time slice accumulate burst credit. Each preemption adds roughly one quarter of a quantum of credit, up to a per-tier cap:
 
-| Tier | Cap (Default/Esports/Legacy) | Cap (Sim profile) | Approx. max bonus |
+| Tier | Cap (Default/Esports) | Cap (Sim profile) | Approx. max bonus |
 | :--- | :--- | :--- | :--- |
 | T0 Critical | none | none | — |
 | T1 Interactive | 2000 kns | 2000 kns | ~2ms |
