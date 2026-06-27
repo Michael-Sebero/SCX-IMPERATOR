@@ -8,9 +8,10 @@
 > - **IRQ-Wake Boosting** Hardware wakeups (GPU vsync, audio DMA, network) immediately promote that task to T0 for one dispatch
 > - **Waker Tier Inheritance** High-priority task waking a lower-priority one lifts the wakee's tier, keeping producer-consumer chains tight
 > - **Lock-Holder Protection** Futex holders get scheduling priority and starvation skips to release locks faster, unblocking waiters sooner
-> - **ETD Calibration** Startup CAS ping-pong measures actual inter-core latency; work stealing always prefers the cheapest path
+> - **ETD Calibration** Startup CAS ping-pong measures actual inter-core latency; cross-LLC work stealing tries the empirically-cheapest LLC first, falling back to index order before calibration completes
 > - **Dispatch Latency Telemetry** Every task tracks its own scheduling latency (enqueue-to-dispatch) as a per-task EWMA; mean dispatch latency is shown live in the TUI summary bar and clipboard export
 > - **Preemption Burst Credit** T1/T2 tasks repeatedly interrupted before completing their quantum earn slice extensions proportional to how many times they were cut short
+> - **Desktop-First DVFS** Every tier runs at full CPU clock by default no power-saving throttle on background work since `scx_imperator` targets mains-powered desktops, not laptops or thermally-constrained systems
 
 ## Navigation
 
@@ -39,14 +40,15 @@ cd SCX-IMPERATOR && cargo build --release
 sudo mv target/release/scx_imperator /bin/
 chmod 755 /bin/scx_imperator
 
-# Run (requires root)
+# Run (requires root) — uses the Default profile, tuned for desktop gaming
 sudo scx_imperator
 
-# Competitive/esports profile
+# Same as above — "gaming" is an accepted alias for the Default profile
+sudo scx_imperator -p gaming
+
+# Competitive/esports profile — tightest worst-case latency, more context-switch overhead
 sudo scx_imperator -p esports
 
-# Legacy profile (more throughput-friendly)
-sudo scx_imperator -p legacy
 ```
 
 [Full Documentation](https://github.com/Michael-Sebero/SCX-IMPERATOR/blob/main/docs/imperator-documentation.md)
@@ -70,14 +72,17 @@ Every task is classified into one of four tiers based on its **EWMA** (Exponenti
 
 ### Tier Gates
 
-| Tier | Name | avg_runtime | Examples | Starvation |
+| Tier | Name | avg_runtime | Examples | Starvation (Default profile) |
 | :--- | :--- | :--- | :--- | :--- |
-| **T0** | Critical | < 100µs | IRQ handlers, mouse input, audio callbacks | 3ms |
+| **T0** | Critical | < 100µs | IRQ handlers, mouse input, audio callbacks | 1.5ms |
 | **T1** | Interactive | < 2ms | Compositor, game physics, AI | 8ms |
-| **T2** | Frame | < 8ms | Game render threads, video encoding | 40ms |
+| **T2** | Frame | < 8ms | Game render threads, video encoding | 20ms |
 | **T3** | Bulk | ≥ 8ms | Compilation, background indexing | 100ms |
 
 T0 always runs before T1, which always runs before T2 and so on. This ordering is encoded directly in the dispatch queue sort key no per-dispatch branching to enforce it.
+
+> [!NOTE]
+> Starvation ceilings vary by profile — see [§5 Profiles](#5-profiles) for the full table. The values above are the **Default** profile's, which doubles as `--profile gaming`. T0 and T2 are tightened to match **Esports** exactly (1.5ms / 20ms) under the desktop policy that audio/input/render latency shouldn't be sacrificed on a system with CPU headroom to spare; T1 and T3 stay looser to favor smoother frame pacing and fewer context switches under normal play.
 
 > [!TIP]
 > **No game task should be in T3.** Game render threads run 2–8ms per frame → T2. Physics/AI run 0.5–2ms → T1. Input handlers run < 100µs → T0. Only tasks doing 8ms+ of uninterrupted CPU work (shader compilation, loading screens) land in T3.
@@ -155,23 +160,28 @@ T0 tasks are excluded because they are already latency-critical and longer slice
 
 ## 5. Profiles
 
-Three profiles are selectable at launch. `Default` is identical to `Gaming`.
+Four profiles are selectable at launch. `gaming` is an accepted alias for `default` — they select the exact same profile, not two separate configurations that happen to match.
 
-| Profile | Base Quantum | T3 New-Flow Bonus | T3 Starvation | T0 Multiplier | T3 Multiplier |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Gaming** | 2ms | 8ms | 100ms | 0.5× | ~4× |
-| **Esports** | 1ms | 4ms | 50ms | 0.25× | ~4× |
-| **Legacy** | 4ms | 12ms | 200ms | 0.75× | 2× |
-| **Sim** | 4ms | 8ms | 200ms | 0.5× | ~4× |
+| Profile | Base Quantum | T0 Starvation | T2 Starvation | T3 Starvation | T0 Multiplier | T3 Multiplier |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Default** (`gaming`) | 2ms | 1.5ms | 20ms | 100ms | 0.25× | ~4× |
+| **Esports** | 1ms | 1.5ms | 20ms | 50ms | 0.25× | ~4× |
+| **Sim** | 4ms | 3ms | 80ms | 200ms | 0.25× | ~4× |
 
-**Gaming** works well for most desktops. **Esports** tightens everything — shorter slices, half the starvation windows, lower T0 multiplier — use it for minimum latency above all else. **Legacy** leans toward fairness; background work completes at a more reasonable pace.
+**Default** (also reachable as `--profile gaming`) is the scheduler-wide default — `sudo scx_imperator` with no flags runs this profile. It matches **Esports** exactly on T0 and T2 worst-case starvation (1.5ms / 20ms): there's no reason to tolerate slower input/audio or render-thread latency on a desktop with CPU headroom to spare, and 20ms is tight enough to keep a starved render thread under 3 frame-times at 144Hz. Where Default differs from Esports is slice size and T1/T3 ceilings — Default uses double the base quantum and a double-length T3 starvation window, trading a larger worst-case margin for fewer context switches under normal, uncontended play. Combined with full-clock DVFS on every tier and lock-holder priority boosting for Wine/Proton, this profile requires no additional configuration on a desktop PC.
 
-**Sim** is designed for strategy, 4X, city-builder, and open-world games where a simulation or streaming thread is the dominant workload. It uses a 4ms quantum (reduces context-switch fragmentation on sustained T2/T3 work), looser T2/T3 starvation thresholds (nothing latency-critical is competing with the sim thread), and enables T3 burst credit — a simulation thread repeatedly preempted by background system work earns proportional slice extensions. T0/T1 latency (audio, input, compositor) is unchanged from Gaming.
+**Esports** tightens slice size and T3 starvation further than Default, at the cost of more context-switch overhead — use it when minimum worst-case latency matters more than raw throughput (e.g. a dedicated competitive-play machine). It is not strictly tighter than Default on every axis: T0/T2 ceilings are now tied between the two profiles.
+
+**Sim** is designed for strategy, 4X, city-builder, and open-world games where a simulation or streaming thread is the dominant workload. It uses a 4ms quantum (reduces context-switch fragmentation on sustained T2/T3 work), looser T2/T3 starvation thresholds (nothing latency-critical is competing with the sim thread), and enables T3 burst credit — a simulation thread repeatedly preempted by background system work earns proportional slice extensions. T1 starvation matches Default exactly (8ms); T0 is proportionally — not literally — as protected as Default's, scaled to Sim's longer base quantum (3ms starvation over a 1ms T0 slice is the same 3× safety margin as Default's 1.5ms over 0.5ms).
 
 > [!NOTE]
-> **Sim vs Gaming on FPS titles:** Sim's looser T3 starvation threshold (200ms) means background tasks take longer to get preempted. On a pure FPS workload this is harmless — background tasks in a gaming session rarely saturate any core — but the safe choice for competitive play remains **Esports** or **Gaming**.
+> **Sim vs Default on FPS titles:** Sim's looser T2/T3 starvation thresholds mean background and render-adjacent tasks take longer to get preempted. On a pure FPS workload this is harmless — background tasks in a gaming session rarely saturate any core — but the safe choice for competitive play remains **Esports** or **Default**.
 
 The `--starvation` flag scales all tier thresholds proportionally from the T3 base, preserving inter-tier ratios.
+
+### DVFS Policy
+
+Every tier on every profile runs at `SCX_CPUPERF_ONE` (100% of hardware-permitted clock) no frequency throttle is applied to background (T3) work the way earlier revisions did. `scx_imperator` targets desktop PCs on mains power; a laptop-style trade of CPU clock for battery or thermal headroom doesn't apply, and a throttled T3 task simply takes longer to finish a shader compile or background install for no benefit when the GPU is the actual bottleneck (the common case in nearly every game). The mechanism that bounds T3's worst-case impact on foreground work is starvation preemption (the table above), not frequency throttling.
 
 ---
 

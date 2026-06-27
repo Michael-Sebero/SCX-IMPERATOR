@@ -28,9 +28,26 @@ use bpf_skel::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Profile {
+    /// Minimum-latency competitive FPS profile. Tightest T0/T1/T2 thresholds
+    /// of any profile; trades smooth long-tail frame pacing for the lowest
+    /// possible worst-case input/render latency.
     Esports,
-    Legacy,
-    Gaming,
+    /// Default desktop-gaming profile (`sudo scx_imperator` with no flags,
+    /// or `--profile default` / `--profile gaming` explicitly — both names
+    /// work and select this exact same profile; there is no separate
+    /// "Gaming" config to confuse this with).
+    ///
+    /// Tuned for a single-PC, mains-powered desktop gaming workload: audio
+    /// and input (T0) get the tightest possible slice and starvation ceiling
+    /// since that work is inherently short-lived and the desktop has CPU
+    /// headroom to spare for it; the render/game-logic thread (T2) is bounded
+    /// to <3 frame-times of starvation at 144Hz so background work (shader
+    /// compilation, asset streaming, Discord, OBS, etc.) cannot visibly
+    /// stutter the frame. Combined with full-clock DVFS on every tier (see
+    /// tier_perf_target[] in imperator_bpf.c) and lock-holder priority
+    /// boosting (lock_bpf.c) for Wine/Proton D3D submission threads, this
+    /// profile requires no additional configuration on a desktop PC.
+    #[value(alias = "gaming")]
     Default,
     /// Simulation / strategy game profile.
     ///
@@ -38,7 +55,7 @@ pub enum Profile {
     /// open-world streaming thread (RTS, 4X, city-builder, open-world RPG)
     /// rather than many short-burst latency-critical threads.
     ///
-    /// Changes vs Gaming:
+    /// Changes vs the Default profile:
     ///   - Larger quantum (4ms) reduces context-switch overhead on sustained T2/T3
     ///   - Looser starvation thresholds: T3 gets 200ms before forced preemption
     ///     (matches Legacy) since nothing latency-critical is competing for the core
@@ -49,7 +66,7 @@ pub enum Profile {
     ///
     /// FPS workloads running under this profile will behave correctly but
     /// may experience slightly higher background-task latency (looser T3
-    /// starvation) than Gaming. Use Gaming/Esports for competitive FPS.
+    /// starvation) than Default. Use Default/Esports for competitive FPS.
     Sim,
 }
 
@@ -57,11 +74,9 @@ impl Profile {
     fn values(&self) -> (u64, u64, u64) {
         match self {
             Profile::Esports => (1000, 4000, 50000),
-            Profile::Legacy  => (4000, 12000, 200000),
-            Profile::Gaming  => (2000, 8000, 100000),
-            Profile::Default => Profile::Gaming.values(),
+            Profile::Default => (2000, 8000, 100000),
             // Sim: 4ms quantum (matches Legacy — reduces context-switch overhead
-            // on sustained T2/T3 work), 8ms new-flow bonus (matches Gaming),
+            // on sustained T2/T3 work), 8ms new-flow bonus (matches Default),
             // 200ms T3 starvation (matches Legacy — sim threads are long-running
             // by nature and nothing latency-critical competes with them).
             Profile::Sim => (4000, 8000, 200000),
@@ -74,19 +89,49 @@ impl Profile {
                 1_500_000, 4_000_000, 20_000_000, 50_000_000,
                 50_000_000, 50_000_000, 50_000_000, 50_000_000,
             ],
-            Profile::Legacy => [
-                6_000_000, 16_000_000, 80_000_000, 200_000_000,
-                200_000_000, 200_000_000, 200_000_000, 200_000_000,
-            ],
-            Profile::Gaming | Profile::Default => [
-                3_000_000, 8_000_000, 40_000_000, 100_000_000,
+            // DESKTOP POLICY (default): scx_imperator targets desktop PCs only —
+            // mains-powered, no thermal/battery constraint — so the Default
+            // profile is tuned as a real desktop-gaming profile rather than a
+            // generic middle ground between Esports and Legacy.
+            //
+            // T0 tightened 3ms -> 1.5ms (matches Esports): there is no reason to
+            // tolerate slower worst-case input/audio latency on a desktop with
+            // CPU headroom to spare — this is a free win with no throughput cost
+            // since T0 work is inherently short-lived.
+            //
+            // T2 tightened 40ms -> 20ms (matches Esports): 40ms is ~5.7 frames at
+            // 144Hz and ~3.3 frames at 240Hz — long enough for a starved render
+            // thread to produce a visible stutter on a high-refresh desktop
+            // monitor, which is the realistic target display for this profile.
+            // 20ms bounds worst-case render-thread starvation to <3 frames at
+            // 144Hz while remaining looser than Esports' T0/T1 (this profile
+            // still favors smoother frame pacing over Esports' minimum-latency
+            // input path).
+            //
+            // T1/T3 and quantum/new-flow-bonus are unchanged from the validated
+            // baseline (see CAKE_DEFAULT_STARVATION_T3 in intf.h and the Arc
+            // Raiders A/B note on enqueue-time kicks) — only T0/T2 needed
+            // tightening to reflect desktop-gaming intent.
+            Profile::Default => [
+                1_500_000, 8_000_000, 20_000_000, 100_000_000,
                 100_000_000, 100_000_000, 100_000_000, 100_000_000,
             ],
-            // Sim: T0/T1 identical to Gaming (audio/input latency unchanged),
-            // T2 loosened to 80ms (matches Legacy — render threads in sim games
-            // have longer, more variable frame times than in FPS titles),
-            // T3 at 200ms (matches Legacy — sim thread is long-running by design,
-            // nothing latency-critical is competing).
+            // Sim: T0 loosened relative to Default (3ms vs Default's 1.5ms) —
+            // these no longer match, despite the original gen7.5 comment claiming
+            // "T0/T1 identical to Gaming" (the profile this comment refers to was
+            // later renamed Default — see Profile enum). That claim predated the
+            // desktop retune above; Default tightened T0 and Sim did not follow.
+            // Left as-is deliberately rather than tightened to match: with the T0
+            // multiplier fix below (256, giving a 1ms T0 slice at Sim's 4ms
+            // quantum), 3ms starvation keeps the same 3x starvation:slice safety
+            // margin as Default (1.5ms / 0.5ms slice = 3x) and Esports (6x) — i.e.
+            // Sim's T0 is proportionally just as protected, scaled to its longer
+            // base quantum, not literally identical in absolute terms. T1 still
+            // matches Default exactly (8ms both). T2 loosened to 80ms (matches
+            // Legacy — render threads in sim games have longer, more variable
+            // frame times than in FPS titles), T3 at 200ms (matches Legacy — sim
+            // thread is long-running by design, nothing latency-critical is
+            // competing).
             Profile::Sim => [
                 3_000_000, 8_000_000, 80_000_000, 200_000_000,
                 200_000_000, 200_000_000, 200_000_000, 200_000_000,
@@ -97,22 +142,50 @@ impl Profile {
     fn tier_multiplier(&self) -> [u32; 8] {
         match self {
             Profile::Esports => [256, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
-            Profile::Gaming | Profile::Default => [512, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
-            Profile::Legacy => [768, 1024, 1536, 2048, 2048, 2048, 2048, 2048],
-            // Sim: T0 multiplier matches Gaming (no change to critical latency),
-            // T1/T2 unchanged, T3 multiplier at 4095 (same as Gaming/Esports max)
-            // — with a 4ms base quantum, T3 gets up to ~16ms quanta, reducing
-            // context-switch fragmentation for sustained simulation work.
-            Profile::Sim => [512, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
+            // DESKTOP POLICY: T0 multiplier matches Esports (256, not 512).
+            // At the 2ms Default-profile quantum, multiplier 512 gave T0 a ~1ms
+            // slice — generous for "Critical" work (IRQ handlers, audio
+            // callbacks, input) that is inherently short-lived and runs many
+            // times per frame. 256 halves it to ~0.5ms, the same T0 slice as
+            // Esports. This is a free responsiveness win: T0 tasks naturally
+            // finish well under either slice, so the shorter cap only bites —
+            // and only helps — on the rare pathological T0 task that overruns,
+            // capping its worst-case hold time on the core sooner.
+            Profile::Default => [256, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
+            // FIX (gen7.5-arithmetic): comment previously claimed Sim's 4ms quantum
+            // at multiplier=512 gave a "~1ms slice, matching what Gaming used to
+            // provide" (the profile referred to here was later renamed Default —
+            // see Profile enum). That arithmetic was wrong: slice = quantum *
+            // (mult/1024), so 4ms * (512/1024) = 2.0ms, not 1ms — double the old
+            // Default profile's actual T0 slice (1ms) and quadruple the current
+            // Default's (0.5ms). Sim's worst-case T0 hold time was never actually
+            // equivalent to Default's; it silently grew further out of step the
+            // moment Default tightened above.
+            //
+            // Tightened 512 -> 256 to restore the same ~1ms T0 slice this comment
+            // always intended Sim to have (4ms * (256/1024) = 1ms — verified below).
+            // Same free-win rationale as Default's T0 tightening above: T0 work
+            // (audio/input) is short-lived regardless of profile, so capping its
+            // worst-case hold time tighter only helps the rare pathological case
+            // and costs nothing on the common path. This still leaves Sim's T0
+            // slice 2x Default's (1ms vs 0.5ms) since Sim's base quantum is 2x
+            // Default's (4ms vs 2ms) — that gap is real and intentional, not a
+            // typo; Sim is the one profile where the base quantum itself is
+            // deliberately longer (see Profile::values(), "reduces context-switch
+            // overhead on sustained T2/T3 work"), so its T0 slice scales with it
+            // by design. T1/T2 unchanged, T3 multiplier at 4095 (same as
+            // Default/Esports max) — with a 4ms base quantum, T3 gets up to ~16ms
+            // quanta, reducing context-switch fragmentation for sustained
+            // simulation work.
+            Profile::Sim => [256, 1024, 2048, 4095, 4095, 4095, 4095, 4095],
         }
     }
 
     fn wait_budget(&self) -> [u64; 8] {
         match self {
             Profile::Esports => [50_000, 1_000_000, 4_000_000, 0, 0, 0, 0, 0],
-            Profile::Legacy  => [200_000, 4_000_000, 16_000_000, 0, 0, 0, 0, 0],
-            Profile::Gaming | Profile::Default => [100_000, 2_000_000, 8_000_000, 0, 0, 0, 0, 0],
-            // Sim: T0/T1 wait budgets match Gaming (audio/input unchanged),
+            Profile::Default => [100_000, 2_000_000, 8_000_000, 0, 0, 0, 0, 0],
+            // Sim: T0/T1 wait budgets match Default (audio/input unchanged),
             // T2 budget loosened to match Legacy (longer frame times tolerated),
             // T3 budget 0 — simulation threads should not be debt-throttled.
             Profile::Sim => [100_000, 2_000_000, 16_000_000, 0, 0, 0, 0, 0],
@@ -150,6 +223,11 @@ impl Profile {
 
 /// 🍰 scx_imperator: A sched_ext scheduler applying CAKE bufferbloat concepts
 ///
+/// DESKTOP PCs ONLY. `sudo scx_imperator` with no flags runs the desktop
+/// Default profile (a.k.a. `--profile gaming`, an accepted alias for the
+/// same profile) — no laptop battery, thermal, or server power-saving logic
+/// exists in this scheduler to configure or disable.
+///
 /// 4-TIER SYSTEM (classified by avg_runtime):
 ///   T0 Critical  (<100µs): IRQ, input, audio, network
 ///   T1 Interact  (<2ms):   compositor, physics, AI
@@ -158,7 +236,10 @@ impl Profile {
 #[derive(Parser, Debug)]
 #[command(author, version, about = "🍰 scx_imperator scheduler", verbatim_doc_comment)]
 struct Args {
-    #[arg(long, short, value_enum, default_value_t = Profile::Gaming)]
+    /// Scheduling profile. Default requires no other flags and is tuned for
+    /// a single mains-powered desktop gaming PC. `--profile gaming` is an
+    /// accepted alias for the same profile.
+    #[arg(long, short, value_enum, default_value_t = Profile::Default)]
     profile: Profile,
     #[arg(long)]
     quantum: Option<u64>,
@@ -334,7 +415,7 @@ impl<'a> Scheduler<'a> {
             rodata.threads_per_ccd  = topo.threads_per_ccd;
 
             // Suggestion 3: sim_mode enables T3 burst credit in imperator_enqueue.
-            // In Gaming/Esports profiles, T3 burst credit is always 0 (T3 bulk
+            // In Default/Esports profiles, T3 burst credit is always 0 (T3 bulk
             // work should not earn slice extensions when preempted by T0/T1).
             // In Sim profile, T3 may be the dominant workload with nothing
             // latency-critical competing — T3 burst credit lets a simulation
