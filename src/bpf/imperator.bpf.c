@@ -990,16 +990,30 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
      * Convert accumulated burst_credit (kns) back to nanoseconds and add to
      * the current slice.
      *
-     * Hard ceiling: CAKE_DEFAULT_MULTIPLIER_T2 × quantum_ns >> 10, which equals
-     * the natural T2 quantum (~4ms at Gaming defaults).  This means:
+     * Hard ceiling: the active T2 natural quantum, read from tier_configs at
+     * runtime via UNPACK_MULTIPLIER(tier_configs[CAKE_TIER_FRAME]).  This
+     * automatically tracks any profile or CLI override that changes T2's
+     * effective multiplier — the ceiling always equals what the scheduler is
+     * actually giving T2 tasks this session.  At Default-profile settings the
+     * result is 2048 × quantum_ns >> 10 = ~4ms, unchanged from the previous
+     * hardcoded constant.
      *   - A T2 task's slice cannot exceed its natural quantum via burst alone.
-     *   - A T1 task's slice can extend up to the T2 natural quantum (i.e. at
-     *     most double its own natural quantum of ~2ms), which is an acceptable
-     *     ceiling — still well below the T1 starvation threshold (8ms).
+     *   - A T1 task's slice can extend up to the T2 natural quantum. This stays
+     *     a comfortable 2x margin below T1's own starvation threshold on
+     *     Esports (2ms ceiling vs 4ms starvation) and Default (4ms vs 8ms) —
+     *     but on Sim (4ms quantum, 2048 multiplier) the T2 natural quantum is
+     *     8ms, exactly equal to Sim's 8ms T1 starvation threshold rather than
+     *     safely below it. This is not a bug: a burst-extended T1 task's own
+     *     slice still ends at or before 8ms, so it cannot itself starve past
+     *     the threshold. It does mean Sim has zero margin between "longest a
+     *     burst-extended T1 dispatch can run" and "longest a second, waiting
+     *     T1 task is guaranteed to wait" — tighter than the other two profiles
+     *     by design, since this ceiling derives directly from Sim's larger
+     *     base quantum. Worth re-checking if Sim's quantum or T1 starvation
+     *     threshold changes independently in a future revision; today they
+     *     move together (both derive from Profile::Sim's 4ms quantum) so the
+     *     1x margin is stable, not coincidental.
      *   - T0 and T3 tasks never reach this block (burst_credit always 0).
-     *
-     * Using CAKE_DEFAULT_MULTIPLIER_T2 by name prevents silent drift if the
-     * T2 multiplier constant is later changed.
      *
      * burst_credit is zeroed before vtime insert so the task re-earns from
      * zero on its next preemption.  Stats: nr_burst_credit_consumed.
