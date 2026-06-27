@@ -48,7 +48,6 @@ sudo scx_imperator -p gaming
 
 # Competitive/esports profile — tightest worst-case latency, more context-switch overhead
 sudo scx_imperator -p esports
-
 ```
 
 [Full Documentation](https://github.com/Michael-Sebero/SCX-IMPERATOR/blob/main/docs/imperator-documentation.md)
@@ -145,16 +144,16 @@ The signal resets on exec and fork, and is skipped for tasks dispatched via the 
 
 T1 (Interactive) and T2 (Frame) tasks that are preempted before completing their time slice accumulate burst credit. Each preemption adds roughly one quarter of a quantum of credit, up to a per-tier cap:
 
-| Tier | Cap | Approx. max bonus |
-| :--- | :--- | :--- |
-| T0 Critical | none | — |
-| T1 Interactive | 2000 kns | ~2ms |
-| T2 Frame | 4000 kns | ~4ms |
-| T3 Bulk | none | — |
+| Tier | Cap (Default/Esports/Legacy) | Cap (Sim profile) | Approx. max bonus |
+| :--- | :--- | :--- | :--- |
+| T0 Critical | none | none | — |
+| T1 Interactive | 2000 kns | 2000 kns | ~2ms |
+| T2 Frame | 4000 kns | 4000 kns | ~4ms |
+| T3 Bulk | none | 1000 kns | Sim only: ~1ms |
 
 The credit is consumed immediately on the same re-enqueue event that earned it, extending the task's slice for that dispatch. A render thread preempted four times in a frame earns proportionally more runway on the next dispatch, reducing the compounding effect of repeated interruptions. Credit is zeroed on tier change, exec, and fork so it never carries across context boundaries.
 
-T0 tasks are excluded because they are already latency-critical and longer slices work against them. T3 tasks are excluded because they are throughput-oriented and burst credit would let them monopolise CPU time.
+T0 tasks are excluded on every profile because they are already latency-critical and longer slices work against them. T3 tasks are excluded everywhere **except** the **Sim** profile, where T3 may legitimately be the dominant, most important workload (the simulation/streaming thread itself) rather than disposable bulk work — a sim thread repeatedly preempted by background system tasks earns a small, capped recovery bonus instead of being treated as low-priority background noise.
 
 ---
 
@@ -278,13 +277,16 @@ When a T0 or T1 task is enqueued into a full LLC, a victim CPU in the same LLC i
 
 ## 8. Overhead
 
-The added cost relative to a minimal sched_ext skeleton is approximately 20%, concentrated in `select_cpu` and `enqueue`. The `dispatch` path the tightest loop under sustained gaming load is unchanged.
+> [!NOTE]
+> The figures below were measured against an earlier revision and have not been re-profiled since. Several features added later in this scheduler's history (ETD-aware steal ordering, the M-2 mailbox-consistency fix, the live `tier_configs`-coupled burst-credit ceiling) touch the functions listed here; their cost is believed small but is not reflected in the numbers below. Treat this table as directionally useful, not as a current measurement.
+
+The added cost relative to a minimal sched_ext skeleton is approximately 20%, concentrated in `select_cpu` and `enqueue`. The cycle counts below predate the ETD-aware steal-ordering feature in `dispatch` (see [§7](#7-work-stealing--topology)) and have not been re-measured since; treat the `dispatch` row as **not current** rather than as a measured zero.
 
 | Function | Added cost | Notes |
 | :--- | :--- | :--- |
 | `select_cpu` | ~2 cycles | Storage skipped on all-busy non-IRQ non-SYNC path |
 | `enqueue` | +6 cycles steady-state; +19 cycles T1/T2 preempt | Mailbox read is the baseline cost; burst credit accumulation and consumption add ~13 cycles on the preemption path only |
-| `dispatch` | 0 | Unchanged |
+| `dispatch` | *unmeasured since ETD-steal was added* | Local-LLC-empty path now computes a cheapest-cost candidate across LLCs before falling back to index order; local-LLC-hit path (the common case) is believed unaffected but has not been re-profiled |
 | `tick` | +2 cycles | Lock-holder check, inside starvation branch only |
 | `running` | +11 cycles | Mailbox write + tier bitmask set + jitter EWMA update (SYNC/idle path: +2 cycles — guard branch only) |
 | `stopping` | +5 cycles | Tier bitmask clear |
@@ -308,7 +310,7 @@ All new fields (`enqueue_time`, `jitter_ewma_us`, `burst_credit`) sit on the sam
 | **DRR++** | Deficit Round Robin++. Network CAKE flow-fairness algorithm adapted for CPU task scheduling. |
 | **Jitter** | Variance in scheduling latency between consecutive events. Low jitter = consistent frame delivery. |
 | **Dispatch Latency** | Time between a task entering the dispatch queue and actually running. Tracked per-task as `jitter_ewma_us`; mean shown live in TUI summary bar. |
-| **Burst Credit** | Per-task slice extension credit earned by T1/T2 tasks on each preemption, consumed on the next dispatch. Bounds: T1 ≈ 2ms, T2 ≈ 4ms. Zeroed on tier change, exec, and fork. |
+| **Burst Credit** | Per-task slice extension credit earned by T1/T2 tasks on each preemption (T3 too, Sim profile only), consumed on the next dispatch. Bounds: T1 ≈ 2ms, T2 ≈ 4ms, T3 ≈ 1ms (Sim only). Zeroed on tier change, exec, and fork. |
 | **kns** | Kilonanoseconds — nanoseconds divided by 1024 (right-shift by 10). Internal unit used for deficit and burst credit to keep values in u16 range. |
 
 ### Architecture
@@ -344,3 +346,5 @@ All new fields (`enqueue_time`, `jitter_ewma_us`, `burst_credit`) sit on the sam
 | Lock-holder detection and starvation skip | scx_lavd (`lock.bpf.c`) |
 | Dispatch latency telemetry (`jitter_ewma_us`) | Original — closes the per-task jitter measurement gap |
 | Preemption burst credit (DRR++ extension) | Original — leaky-bucket burst allowance applied to CPU time-slice management |
+| ETD-aware steal ordering (cheapest-LLC-first) | Original — extends ETD calibration from a fallback-avoidance signal into an active steal-ordering input |
+| Desktop-first DVFS policy (no T3 throttle, starvation-bounded instead) | Original — replaces frequency throttling with starvation preemption as the mechanism bounding background-task impact |
