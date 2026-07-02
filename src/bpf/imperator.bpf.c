@@ -895,6 +895,59 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
      * guard in imperator_running skips stale reads. */
     tctx_reg->enqueue_time = (u32)now_cached;
 
+    /* FIX (audit/F-01): Gap-1 post-sleep recovery — relocated here from
+     * reclassify_task_cold/imperator_stopping, where it read sleep_entry_time
+     * immediately after that same call had just (re)written it, so it never
+     * saw a value that had survived from an actual prior sleep. See the
+     * comment left in reclassify_task_cold for the full failure mode.
+     *
+     * PROBLEM this fixes: a game render thread spending 30s in T3 during a
+     * loading screen needs 10+ EWMA bouts (~20-32ms) to recover to T1/T2 once
+     * gameplay resumes, causing frame-time spikes at session start.
+     *
+     * MECHANISM (corrected): imperator_stopping stamps sleep_entry_time once,
+     * at the moment the task genuinely blocks (runnable=false), and does not
+     * touch it again. This function runs at the task's actual next wakeup —
+     * the only other place enqueue_time is stamped — so comparing the two
+     * here yields a real elapsed-sleep duration instead of a same-event
+     * self-subtraction:
+     *
+     *   sleep_ns = now_cached - tctx_reg->sleep_entry_time
+     *
+     * Both operands are u32 truncations of scx_bpf_now(), so the subtraction
+     * wraps correctly for sleeps up to ~4.3 seconds. Sleeps > 4.3s produce a
+     * smaller wrapped value that may not exceed the 500ms threshold — the
+     * heuristic simply may not fire for very long sleeps, which is acceptable
+     * (those tasks recover via normal EWMA convergence over 3-5 bouts).
+     *
+     * 500ms threshold: above any gaming frame cadence (24fps = 42ms period)
+     * but short enough to catch loading screens and multi-second idles.
+     *
+     * Tier midpoints (halving distance to midpoint decays stale history):
+     *   T0 Critical  (<100µs):   ~50µs
+     *   T1 Interact  (<2000µs):  ~1050µs
+     *   T2 Frame     (<8000µs):  ~5000µs
+     *   T3 Bulk      (≥8000µs):  floor = 8001µs
+     *
+     * sleep_entry_time == 0 correctly skips both ordinary non-sleep wakeups
+     * (it's only ever set by the runnable=false path in imperator_stopping)
+     * and preempted-while-runnable re-enqueues (imperator_stopping clears it
+     * to 0 on that path), regardless of which enq_flag brought us here. */
+    if (tctx_reg->sleep_entry_time != 0) {
+        u32 sleep_ns = (u32)now_cached - tctx_reg->sleep_entry_time;
+        if (sleep_ns > 500000000U) {
+            static const u16 tier_sleep_mid[4] = { 50, 1050, 5000, 8001 };
+            u8  s_tier    = GET_TIER(tctx_reg);
+            u32 cur_fused = tctx_reg->deficit_avg_fused;
+            u16 cur_avg   = EXTRACT_AVG_RT(cur_fused);
+            u16 mid       = tier_sleep_mid[CAKE_TIER_IDX(s_tier)];
+            /* Halve the distance to midpoint: one step, EWMA converges in 3-5 bouts */
+            tctx_reg->deficit_avg_fused = PACK_DEFICIT_AVG(EXTRACT_DEFICIT(cur_fused),
+                                                            (u16)((cur_avg + mid) >> 1));
+        }
+        tctx_reg->sleep_entry_time = 0;  /* Consume — one-shot per genuine sleep */
+    }
+
     /* Standard Tier Logic */
     u8 tier = CAKE_TIER_IDX(GET_TIER(tctx_reg));
     u64 slice = tctx_reg->next_slice;
@@ -1433,6 +1486,37 @@ const u32 tier_perf_target[8] = {
     1024, 1024, 1024, 1024,  /* padding — safe via CAKE_TIER_IDX & 7 */
 };
 
+/* FIX (audit/F-02): dsq_hint encoding — was (target >> 2), collided with the
+ * BSS-zero "unset" sentinel whenever a real target encoded to 0.
+ *
+ * PROBLEM this fixes: 1024 (SCX_CPUPERF_ONE) >> 2 = 256, which truncates to
+ * a u8 as 0 — identical to the BSS-zero value every mailbox starts at before
+ * its first DVFS write.  Once desktop policy made every entry in
+ * tier_perf_target[] equal to 1024 (see table above), *every* real target a
+ * CPU could ever compute also encoded to 0.  The hysteresis check
+ * (cached_perf != target_cached) was therefore permanently "0 != 0" — false
+ * on the very first tick, and every tick after — so scx_bpf_cpuperf_set()
+ * was never called on a non-hybrid system: not once, for the life of the
+ * scheduler.  Two comments in this codebase documented the *old* table (T3
+ * at 75% => dsq_hint=192, correctly distinct from 0) and were never updated
+ * when the table changed to all-1024; the hysteresis they describe stopped
+ * matching the code the moment that happened.
+ *
+ * FIX: widen the shift to >>3 and add a +1 offset.  target ranges [0,1024]
+ * (or [0,1024] scaled by cap on hybrid systems, still within that range), so
+ * (target >> 3) ranges [0,128] and +1 gives [1,129] — comfortably inside a
+ * u8 (max 255) with zero risk of ever landing back on 0.  0 is now reserved
+ * exclusively for "never set"; every real target, including 1024, encodes to
+ * a nonzero value distinct from the unset sentinel.  Cost: hysteresis now
+ * buckets in units of 8 (out of a 1024-unit range, i.e. <0.8% resolution
+ * loss) instead of 4 — negligible for a cache whose only job is deciding
+ * whether to re-issue the kfunc, and a small, bounded price for eliminating
+ * the collision for every possible target value, not just the current
+ * all-1024 desktop table (a future profile that reintroduces per-tier
+ * throttling will not silently reopen this bug). */
+#define DSQ_HINT_UNSET(v)       ((v) == 0)
+#define DSQ_HINT_ENCODE(target) ((u8)(((target) >> 3) + 1))
+
 void BPF_STRUCT_OPS(imperator_tick, struct task_struct *p)
 {
     /* Register pin p to r6 to avoid stack spills */
@@ -1636,28 +1720,17 @@ mailbox_dvfs_max:; /* Sole-occupant fast path: skip tier lookup, pin to max freq
      * maximum unconditionally — the tier-proportional table is bypassed.
      * Mailbox tier is still updated so waker-tier inheritance is correct.
      *
-     * dsq_hint encoding note (FIX audit/Finding-2, documentation):
-     * dsq_hint caches (cpuperf_target >> 2) in a u8 to detect unchanged DVFS
-     * targets and avoid redundant kfunc calls.  SCX_CPUPERF_ONE = 1024;
-     * 1024 >> 2 = 256, which truncates to u8 = 0.  This means dsq_hint == 0
-     * encodes "target = SCX_CPUPERF_ONE" — the same value as the BSS-zero
-     * uninitialized state and the same value written by the standard mailbox_dvfs
-     * path for T0/T1/T2 tasks (which all have target = 1024 = SCX_CPUPERF_ONE).
-     * The encoding is consistent and deliberately correct:
-     *   - BSS zero → first tick sees dsq_hint=0, target_cached=0, calls kfunc ✓
-     *   - T0/T1/T2 or sole-occupant → dsq_hint=0, already at max, skip kfunc ✓
-     *   - T3 → dsq_hint=192 (768>>2); non-zero ≠ 0, calls kfunc ✓
-     * The hysteresis is correct even though 0 is the BSS default, because
-     * the first call always sets the target (cached=0, target_cached=0 on
-     * T0/T1/T2 only after the first non-zero tier transitions through). */
+     * dsq_hint encoding: see DSQ_HINT_ENCODE/DSQ_HINT_UNSET above (audit/F-02).
+     * cached_perf_max == 0 means "never set for this CPU" unconditionally —
+     * that state calls the kfunc regardless of what max_target_cached happens
+     * to be, so there is no longer a special case to reason about here. */
     {
         u8 max_flags = (u8)(MBOX_VALID_FLAG | (tier_reg & MBOX_TIER_MASK));
         if (imperator_relaxed_load_u8(&mbox->flags) != max_flags)
             imperator_relaxed_store_u8(&mbox->flags, max_flags);
-        /* SCX_CPUPERF_ONE=1024 >> 2 = 256 → u8 = 0.  See encoding note above. */
         u8 cached_perf_max = imperator_relaxed_load_u8(&mbox->dsq_hint);
-        u8 max_target_cached = (u8)(SCX_CPUPERF_ONE >> 2);  /* intentionally 0 */
-        if (cached_perf_max != max_target_cached) {
+        u8 max_target_cached = DSQ_HINT_ENCODE(SCX_CPUPERF_ONE);
+        if (DSQ_HINT_UNSET(cached_perf_max) || cached_perf_max != max_target_cached) {
             scx_bpf_cpuperf_set(cpu_id_reg, SCX_CPUPERF_ONE);
             imperator_relaxed_store_u8(&mbox->dsq_hint, max_target_cached);
         }
@@ -1696,8 +1769,8 @@ mailbox_dvfs:; /* FIX: empty statement separates label from declaration (C99 §6
         target = (target * cap) >> 10;  /* scale by capability (1024 = 100%) */
     }
     u8 cached_perf = imperator_relaxed_load_u8(&mbox->dsq_hint);
-    u8 target_cached = (u8)(target >> 2);
-    if (cached_perf != target_cached) {
+    u8 target_cached = DSQ_HINT_ENCODE(target);
+    if (DSQ_HINT_UNSET(cached_perf) || cached_perf != target_cached) {
         scx_bpf_cpuperf_set(cpu_id_reg, target);
         imperator_relaxed_store_u8(&mbox->dsq_hint, target_cached);
     }
@@ -1848,7 +1921,7 @@ static const u16 tier_overrun_gate[4] = {
  * at the same tier.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static __attribute__((noinline))
-void reclassify_task_cold(struct imperator_task_ctx *tctx, bool runnable)
+void reclassify_task_cold(struct imperator_task_ctx *tctx)
 {
     u32 packed = imperator_relaxed_load_u32(&tctx->packed_info);
 
@@ -1860,65 +1933,25 @@ void reclassify_task_cold(struct imperator_task_ctx *tctx, bool runnable)
 
     u32 runtime_raw = now - last_run;
 
-    /* FIX (post-load recovery / Gap-1): Pull avg_runtime toward the tier
-     * midpoint when a task wakes from a genuine long sleep (> 500ms).
+    /* FIX (audit/F-01): the Gap-1 post-sleep recovery heuristic used to live
+     * here, gated on `!runnable`.  It has been RELOCATED to imperator_enqueue.
      *
-     * PROBLEM this fixes: A game render thread spending 30s in T3 during a
-     * loading screen needs 10+ EWMA bouts (~20–32ms) to recover to T1/T2 once
-     * gameplay resumes, causing frame-time spikes at session start.
+     * reclassify_task_cold's only caller is imperator_stopping, which writes
+     * tctx->sleep_entry_time for *this* stop event immediately before calling
+     * it — so the value read here was always "now," never a timestamp that
+     * survived from a prior sleep through an intervening wakeup, and
+     * tctx->enqueue_time is unconditionally 0 at this point (already consumed
+     * by imperator_running, or never set on the direct-dispatch path). The
+     * computed "sleep_ns" was therefore `0 - sleep_entry_time_just_written`,
+     * a u32 wraparound of the current timestamp with no relationship to real
+     * elapsed sleep time — it exceeded the 500ms threshold on the large
+     * majority of *all* blocking events, not just genuine long sleeps.
      *
-     * MECHANISM: When the task genuinely blocked (runnable=false in
-     * imperator_stopping), sleep_entry_time was stamped with the wall-clock
-     * nanosecond timestamp at that moment.  At the next wakeup, enqueue_time
-     * is stamped in imperator_enqueue.  The sleep duration is therefore:
-     *
-     *   sleep_ns = tctx->enqueue_time - tctx->sleep_entry_time
-     *
-     * Both fields are u32 truncations of scx_bpf_now(), so the subtraction
-     * wraps correctly for sleeps up to ~4.3 seconds.  Sleeps > 4.3s produce
-     * a small wrapped value that does not exceed the 500ms threshold — the
-     * heuristic simply does not fire for very long sleeps, which is acceptable
-     * (those tasks will recover via normal EWMA convergence over 3–5 bouts).
-     *
-     * CORRECTION (Gap-1 / audit/Finding-6): Previous code used runtime_raw
-     * (now - last_run_at = BOUT duration, not SLEEP duration).  A task waking
-     * from a 30-second sleep after a 5ms bout had runtime_raw=5ms and never
-     * triggered the 500ms threshold — the heuristic was functionally inert.
-     * sleep_entry_time correctly measures the period the task was actually
-     * absent from a CPU.
-     *
-     * 500ms threshold: above any gaming frame cadence (24fps = 42ms period)
-     * but short enough to catch loading screens and multi-second idles.
-     *
-     * Tier midpoints (halving distance to midpoint decays stale history):
-     *   T0 Critical  (<100µs):   ~50µs
-     *   T1 Interact  (<2000µs):  ~1050µs
-     *   T2 Frame     (<8000µs):  ~5000µs
-     *   T3 Bulk      (≥8000µs):  floor = 8001µs
-     *
-     * W-3 / pre-impl-audit gate: !runnable confirms the task genuinely
-     * blocked rather than being preempted while still runnable.  A runnable-
-     * but-starved task with sleep_entry_time=0 (cleared in imperator_stopping
-     * when runnable=true) also correctly skips the heuristic. */
-    if (!runnable && tctx->sleep_entry_time != 0) {
-        u32 sleep_ns = tctx->enqueue_time - tctx->sleep_entry_time;
-        if (sleep_ns > 500000000U) {
-            static const u16 tier_sleep_mid[4] = { 50, 1050, 5000, 8001 };
-            u8  s_tier    = (packed >> SHIFT_TIER) & MASK_TIER;
-            u32 cur_fused = tctx->deficit_avg_fused;
-            u16 cur_avg   = EXTRACT_AVG_RT(cur_fused);
-            u16 mid       = tier_sleep_mid[CAKE_TIER_IDX(s_tier)];
-            /* Halve the distance to midpoint: one step, EWMA converges in 3-5 bouts */
-            tctx->deficit_avg_fused = PACK_DEFICIT_AVG(EXTRACT_DEFICIT(cur_fused),
-                                                       (u16)((cur_avg + mid) >> 1));
-        }
-        /* Consume the sleep timestamp regardless of threshold — prevents a
-         * stale sleep_entry_time from contaminating a future bout if the task
-         * is preempted and re-enqueued multiple times before the next genuine
-         * block (sleep_entry_time would be overwritten at the next blocking
-         * imperator_stopping anyway, but zeroing here is defensive). */
-        tctx->sleep_entry_time = 0;
-    }
+     * The fix needs sleep_entry_time (stamped at sleep-start, in
+     * imperator_stopping) compared against a timestamp taken at the task's
+     * actual next wakeup — that pairing only exists in imperator_enqueue,
+     * where enqueue_time is stamped. See the "Gap-1 post-sleep recovery"
+     * block there for the corrected mechanism; nothing here depends on it. */
 
     u32 runtime_us = runtime_raw >> 10;  /* ns → ~μs (÷1024 ≈ ÷1000) */
 
@@ -2346,22 +2379,24 @@ void BPF_STRUCT_OPS(imperator_stopping, struct task_struct *p, bool runnable)
             &tier_cpu_mask[stop_tier & (CAKE_TIER_MAX - 1)],
             ~(1ULL << stop_cpu));
 
-        /* FIX (W-3): Pass `runnable` through to reclassify_task_cold so the
-         * 500ms post-sleep recovery heuristic can be correctly gated on
-         * !runnable (genuine block/sleep) vs runnable (preempted/starved).
-         *
-         * Gap-1 fix: stamp sleep_entry_time when the task genuinely blocks.
+        /* Gap-1 fix (relocated — see audit/F-01): stamp sleep_entry_time when
+         * the task genuinely blocks.
          *
          * sleep_entry_time records (u32)scx_bpf_now() at the moment the task
-         * transitions to sleep/block (runnable=false).  reclassify_task_cold
-         * reads it at the next wakeup (via imperator_enqueue's enqueue_time) to
-         * compute actual sleep duration rather than bout duration.
+         * transitions to sleep/block (runnable=false), and is left untouched
+         * from here on — reclassify_task_cold no longer reads or clears it.
+         * It is read and consumed at the task's actual next wakeup, in
+         * imperator_enqueue (paired against the enqueue_time stamped there),
+         * since that is the only place a genuine wakeup timestamp exists.
+         * Reading it here instead — immediately after writing it, within the
+         * same stop event — was the original bug: it compared "now" against
+         * itself rather than against a timestamp from the task's real wakeup.
          *
          * When runnable=true (preempted, slice expired, etc.) we write 0 to
          * clear any stale value left from a previous sleep.  This ensures the
-         * sentinel check in reclassify_task_cold (sleep_entry_time == 0 → skip)
-         * correctly suppresses the heuristic for tasks that are descheduled
-         * while runnable rather than sleeping.
+         * sentinel check at the consuming site in imperator_enqueue
+         * (sleep_entry_time == 0 → skip) correctly suppresses the heuristic
+         * for tasks that are descheduled while runnable rather than sleeping.
          *
          * scx_bpf_now() is already called earlier in imperator_tick for this CPU;
          * calling it again here costs ~10-15ns but is unavoidable since stopping
@@ -2372,7 +2407,7 @@ void BPF_STRUCT_OPS(imperator_stopping, struct task_struct *p, bool runnable)
         else
             tctx->sleep_entry_time = 0;
 
-        reclassify_task_cold(tctx, runnable);
+        reclassify_task_cold(tctx);
     }
 }
 

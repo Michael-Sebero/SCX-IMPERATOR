@@ -214,10 +214,25 @@ struct imperator_task_ctx {
      *
      * FIX: sleep_entry_time records the wall-clock timestamp (u32 nanoseconds,
      * same truncation as last_run_at and enqueue_time) at the moment a task
-     * genuinely blocks — written in imperator_stopping when runnable=false.
-     * reclassify_task_cold reads it at wakeup (in imperator_enqueue via the
-     * tctx passed at stopping time) to compute actual sleep duration:
+     * genuinely blocks — written in imperator_stopping when runnable=false,
+     * and left untouched from there.  It is read and consumed at the task's
+     * actual next wakeup, in imperator_enqueue (paired against the
+     * enqueue_time stamped there in the same call), to compute actual sleep
+     * duration:
      *   sleep_duration = enqueue_time_at_wakeup - sleep_entry_time
+     *
+     * FIX (audit/F-01): earlier revisions of this comment (and the code)
+     * had reclassify_task_cold performing this read, gated on the `runnable`
+     * parameter imperator_stopping passed it.  That placement was itself
+     * buggy: reclassify_task_cold's only caller is imperator_stopping, which
+     * unconditionally (re)writes sleep_entry_time for the *current* stop
+     * event immediately before calling it — so the value read there was
+     * always "now," never a timestamp surviving from a prior sleep through
+     * an intervening wakeup, and enqueue_time was unconditionally 0 at that
+     * point (already consumed by imperator_running, or never set on the
+     * direct-dispatch path). The relocation to imperator_enqueue described
+     * above is the fix; reclassify_task_cold no longer takes a `runnable`
+     * parameter or touches this field at all.
      *
      * The subtraction is u32 wrap-safe for any sleep < 4.3 seconds, which
      * covers all gaming and sim loading scenarios.  For sleeps > 4.3s the
@@ -229,7 +244,7 @@ struct imperator_task_ctx {
      *   alloc_task_ctx_cold  → sleep_entry_time = 0 (explicit zero)
      *   imperator_stopping   → write (u32)scx_bpf_now() when !runnable
      *                        → write 0 when runnable (clear stale value)
-     *   reclassify_task_cold → read and consume (compared against enqueue_time)
+     *   imperator_enqueue    → read and consume (compared against enqueue_time)
      *   imperator_init_task  → reset to 0 on exec and fork
      *
      * SENTINEL: 0 means "no valid sleep entry timestamp" — the heuristic is
@@ -296,30 +311,40 @@ _Static_assert(sizeof(struct imperator_task_ctx) == 64,
 
 struct mega_mailbox_entry {
     u8 flags;
-    /* dsq_hint: DVFS perf-target hysteresis cache (u8 = cpuperf_target >> 2).
+    /* dsq_hint: DVFS perf-target hysteresis cache (u8, encodes cpuperf_target).
      * Name is historical (original use was DSQ selection hint, now removed);
      * the field stores the last written DVFS target to skip redundant kfunc
      * calls when the tier has not changed between ticks.
      *
-     * Encoding (audit/Finding-2): stores (cpuperf_target >> 2) as u8.
-     * cpuperf_target range [0, SCX_CPUPERF_ONE=1024].
-     *   T3 Gaming  → target=768  → dsq_hint=192
-     *   T0/T1/T2   → target=1024 → dsq_hint=256 → u8=0  (wraps)
-     *   Sole-occ.  → target=1024 → dsq_hint=256 → u8=0  (same wrap, correct)
-     *   BSS zero   → dsq_hint=0  (same as T0/T1/T2 — first tick always calls kfunc
-     *                              because target_cached is also 0 on first read,
-     *                              but the kfunc call is idempotent so this is safe)
+     * Encoding (audit/F-02, supersedes the audit/Finding-2 encoding below):
+     * stores ((cpuperf_target >> 3) + 1) as u8. cpuperf_target range is
+     * [0, SCX_CPUPERF_ONE=1024], so the encoded range is [1, 129] — 0 is
+     * reserved exclusively for "never written for this CPU" (the BSS-zero
+     * default) and cannot be produced by any real target, including 1024:
+     *   BSS zero          → dsq_hint=0  → always treated as unset, calls kfunc
+     *   target=0            → dsq_hint=1
+     *   target=768 (old T3) → dsq_hint=97
+     *   target=1024 (max)   → dsq_hint=129
      *
-     * The 0 encoding for SCX_CPUPERF_ONE is deliberate: any transition TO max
-     * frequency sets dsq_hint=0; subsequent ticks see cached==target==0 and skip
-     * the kfunc call.  The encoding is consistent across all paths that write it.
+     * The PREVIOUS encoding (>> 2, no offset) let target=1024 truncate to the
+     * same u8 value as BSS-zero (1024>>2=256, which wraps to 0 in a u8) —
+     * indistinguishable from "unset". Once tier_perf_target[] in
+     * imperator_bpf.c was changed so every tier equals 1024 (desktop policy,
+     * see that table's comment), every real target collided with the unset
+     * sentinel and the hysteresis check was permanently "0 != 0" — false on
+     * every tick, forever. scx_bpf_cpuperf_set() was never called on
+     * non-hybrid systems. See DSQ_HINT_ENCODE/DSQ_HINT_UNSET in
+     * imperator_bpf.c for the fix and full writeup; both call sites there
+     * now also treat dsq_hint==0 as an explicit "unset, always call the
+     * kfunc" case rather than relying on it comparing equal to a real target.
      *
      * NOTE (perf-regression-guard): an earlier revision of this comment
-     * documented a planned T2 target of 896 (dsq_hint=224) that was never
-     * applied to tier_perf_target[] in imperator_bpf.c, and a later revision
-     * applied it without supporting A/B evidence. T2 has been reverted to
-     * 1024 to match the validated baseline — see tier_perf_target[]'s comment
-     * in imperator_bpf.c for the full rationale. If T2 DVFS tuning is
+     * documented a planned T2 target of 896 (which under the old >>2 encoding
+     * would have been dsq_hint=224) that was never applied to
+     * tier_perf_target[] in imperator_bpf.c, and a later revision applied it
+     * without supporting A/B evidence. T2 has been reverted to 1024 to match
+     * the validated baseline — see tier_perf_target[]'s comment in
+     * imperator_bpf.c for the full rationale. If T2 DVFS tuning is
      * revisited, update both this comment and the table in the same change. */
     u8 dsq_hint;
     u8 tick_counter;
