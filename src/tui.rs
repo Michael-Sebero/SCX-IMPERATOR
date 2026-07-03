@@ -27,7 +27,12 @@ use crate::bpf_skel::BpfSkel;
 use crate::stats::TIER_NAMES;
 use crate::topology::TopologyInfo;
 
-fn aggregate_stats(skel: &BpfSkel) -> imperator_stats {
+// FIX (audit/F-04): made `pub` so main.rs's headless stats-logging path
+// (Scheduler::log_stats_summary) can reuse the exact same aggregation the
+// interactive dashboard uses, rather than duplicating this loop. Keeps the
+// TUI and headless numbers guaranteed identical instead of two codepaths
+// that could drift apart.
+pub fn aggregate_stats(skel: &BpfSkel) -> imperator_stats {
     let mut total: imperator_stats = Default::default();
 
     if let Some(bss) = &skel.maps.bss_data {

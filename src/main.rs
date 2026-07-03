@@ -252,8 +252,26 @@ struct Args {
     new_flow_bonus: Option<u64>,
     #[arg(long)]
     starvation: Option<u64>,
+    /// Launch the interactive TUI dashboard. Also enables scheduler
+    /// telemetry collection (BPF-side `enable_stats`) for the duration of
+    /// the session — see --stats if you want telemetry without the TUI.
     #[arg(long, short)]
     verbose: bool,
+    /// FIX (audit/F-04): enable scheduler telemetry (BPF-side `enable_stats`
+    /// — tier dispatch counts, starvation preempts, dispatch-latency EWMA,
+    /// C3 burst-credit counters, etc.) without launching the interactive
+    /// TUI. For headless/systemd deployments: with this flag, a summary is
+    /// logged periodically (see Scheduler::log_stats_summary) and the raw
+    /// per-CPU counters remain readable via `bpftool map dump` on the
+    /// `bss` map — neither is possible without it, since --verbose was
+    /// previously the *only* way to turn telemetry on at all. Redundant
+    /// (harmless) when combined with --verbose, which already implies it.
+    #[arg(long, short = 's')]
+    stats: bool,
+    /// TUI dashboard refresh interval, in seconds. Only affects --verbose
+    /// mode; headless stats logging (--stats without --verbose) uses its
+    /// own fixed ~60s cadence, piggybacked on the event loop's existing
+    /// signal-wait timeout rather than a separate configurable timer.
     #[arg(long, default_value_t = 1)]
     interval: u64,
 }
@@ -375,7 +393,15 @@ impl<'a> Scheduler<'a> {
         if let Some(rodata) = &mut open_skel.maps.rodata_data {
             rodata.quantum_ns       = quantum * 1000;
             rodata.new_flow_bonus_ns = new_flow_bonus * 1000;
-            rodata.enable_stats     = args.verbose;
+            // FIX (audit/F-04): was `args.verbose` only, meaning the standard
+            // headless/systemd deployment (no -v) collected zero telemetry —
+            // every field in imperator_stats stayed at 0 for the life of the
+            // session, silently, with no way to tell that from a stats dump.
+            // --stats now enables the identical BPF-side collection
+            // independently of the TUI; see Args::stats and
+            // Scheduler::log_stats_summary for the headless-visibility half
+            // of this fix.
+            rodata.enable_stats     = args.verbose || args.stats;
             rodata.tier_configs     = args.profile.tier_configs(quantum, args.starvation);
             rodata.has_hybrid       = topo.has_hybrid_cores;
 
@@ -455,6 +481,18 @@ impl<'a> Scheduler<'a> {
             .context("Failed to attach scheduler")?;
 
         self.show_startup_splash()?;
+
+        // FIX (audit/F-04): make telemetry status explicit rather than silent.
+        // Previously there was no way to tell, from the log alone, whether
+        // BPF stats collection was active — a headless run with stats off
+        // and a headless run with stats on looked identical until someone
+        // went looking at the BPF map directly.
+        if self.args.verbose || self.args.stats {
+            info!(
+                "Scheduler telemetry enabled (tier dispatches, starvation preempts, \
+                 dispatch-latency EWMA, C3 burst-credit counters)"
+            );
+        }
 
         let mut etd_written = self.try_write_etd_costs();
 
@@ -544,10 +582,16 @@ impl<'a> Scheduler<'a> {
                         }
                     }
                     Ok(_) => {
-                        // 60 s timeout: retry ETD write (covers eventfd-unavailable path)
-                        // and check for BPF scheduler exit via UEI.
+                        // 60 s timeout: retry ETD write (covers eventfd-unavailable path),
+                        // log a periodic stats summary when telemetry is enabled without
+                        // the TUI (FIX audit/F-04 — piggybacks on this existing timeout
+                        // rather than introducing a second, separately-configurable
+                        // timer), and check for BPF scheduler exit via UEI.
                         if !etd_written {
                             etd_written = self.try_write_etd_costs();
+                        }
+                        if self.args.stats {
+                            self.log_stats_summary();
                         }
                         if scx_utils::uei_exited!(&self.skel, uei) {
                             match scx_utils::uei_report!(&self.skel, uei) {
@@ -637,6 +681,66 @@ impl<'a> Scheduler<'a> {
             info!("ETD: LLC cost table written ({} LLCs)", nr_llcs);
         }
         true
+    }
+
+    /// FIX (audit/F-04): periodic headless telemetry summary.
+    ///
+    /// BPF stats collection (`enable_stats`) used to be wired 1:1 to
+    /// `--verbose`, which also launches the interactive TUI — there was no
+    /// way to collect scheduler telemetry without a TTY and a live
+    /// dashboard attached. The common deployment (a background daemon under
+    /// systemd, no `-v`) therefore got zero observability: every field in
+    /// `imperator_stats` stayed at 0 for the life of the session, and any
+    /// external tool reading the BPF map directly saw permanent, silent
+    /// zeros with no signal that stats were disabled at all.
+    ///
+    /// `--stats` now enables the identical BPF-side collection independently
+    /// of `--verbose` (see `rodata.enable_stats` in `Scheduler::new`), and
+    /// this method — called from the headless event loop's existing 60s
+    /// timeout branch, so no separate timer is introduced — logs a summary
+    /// via the standard `log` crate. That gives systemd/journald visibility
+    /// without requiring `bpftool`, while `bpftool map dump` on the `bss`
+    /// map remains available for anyone who wants the raw per-CPU counters
+    /// this summary is aggregated from.
+    ///
+    /// Reuses `tui::aggregate_stats` — the exact same aggregation the
+    /// interactive dashboard uses — so headless and TUI numbers are always
+    /// computed identically and can never drift apart into two competing
+    /// implementations of the same sum.
+    ///
+    /// Cadence is the ~60s poll timeout already in the event loop, not
+    /// `--interval` (which stays TUI-refresh-only, see Args::interval) —
+    /// a background daemon's log wants an infrequent heartbeat, not a
+    /// dashboard's once-a-second refresh rate.
+    fn log_stats_summary(&self) {
+        let stats = tui::aggregate_stats(&self.skel);
+
+        let mean_jitter = if stats.nr_jitter_ewma_count == 0 {
+            "n/a (no DSQ-path samples yet)".to_string()
+        } else {
+            format!(
+                "{:.1}µs ({} samples)",
+                stats.nr_jitter_ewma_sum as f64 / stats.nr_jitter_ewma_count as f64,
+                stats.nr_jitter_ewma_count
+            )
+        };
+
+        info!(
+            "scheduler stats: dispatches[new={} old={}] tier_dispatches={:?} \
+             starvation_preempts={:?} lock_holder_skips={} irq_wake_boosts={} \
+             waker_tier_boosts={} burst_credit[earned={} consumed={}] \
+             mean_dispatch_latency={}",
+            stats.nr_new_flow_dispatches,
+            stats.nr_old_flow_dispatches,
+            stats.nr_tier_dispatches,
+            stats.nr_starvation_preempts_tier,
+            stats.nr_lock_holder_skips,
+            stats.nr_irq_wake_boosts,
+            stats.nr_waker_tier_boosts,
+            stats.nr_preempt_with_credit,
+            stats.nr_burst_credit_consumed,
+            mean_jitter,
+        );
     }
 
     fn show_startup_splash(&self) -> Result<()> {
