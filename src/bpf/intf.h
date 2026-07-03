@@ -438,33 +438,41 @@ struct imperator_stats {
 #define CAKE_DEFAULT_MULTIPLIER_T1  1024
 #define CAKE_DEFAULT_MULTIPLIER_T2  2048
 #define CAKE_DEFAULT_MULTIPLIER_T3  4095
-#define CAKE_DEFAULT_WAIT_BUDGET_T0 100000
-#define CAKE_DEFAULT_WAIT_BUDGET_T1 2000000
-#define CAKE_DEFAULT_WAIT_BUDGET_T2 8000000
-#define CAKE_DEFAULT_WAIT_BUDGET_T3 0
 
-/* Fused tier config: [Mult:12][Quantum:16][Budget:16][Starve:20] */
+/* FIX (audit/F-03): CAKE_DEFAULT_WAIT_BUDGET_T0-T3 removed, along with
+ * CFG_SHIFT_BUDGET / CFG_MASK_BUDGET / UNPACK_BUDGET_NS below and the
+ * budget_kns parameter of PACK_CONFIG. The values were fully computed
+ * per-profile in main.rs's Profile::wait_budget() and packed into
+ * tier_configs, but no BPF code path ever called UNPACK_BUDGET_NS —
+ * confirmed by exhaustive grep across imperator_bpf.c and lock_bpf.c — and
+ * no comment anywhere in the codebase documented what the field was meant
+ * to drive. Rather than add new, unvalidated scheduling logic to make a
+ * guessed-at purpose real, the field has been removed. Starvation has been
+ * repacked from bit 44 down to bit 28 to reclaim the freed range instead of
+ * leaving a gap; see the layout comment below. If a genuine wait-budget
+ * mechanism is designed in the future, it should go through this project's
+ * normal A/B validation (the Arc Raiders 1%-low methodology referenced
+ * elsewhere in this file) before shipping, the same as any other tuning
+ * change here. */
+
+/* Fused tier config: [Mult:12][Quantum:16][Starve:20][Rsvd:16] */
 typedef u64 fused_config_t;
 
 #define CFG_SHIFT_MULTIPLIER  0
 #define CFG_SHIFT_QUANTUM     12
-#define CFG_SHIFT_BUDGET      28
-#define CFG_SHIFT_STARVATION  44
+#define CFG_SHIFT_STARVATION  28
 
 #define CFG_MASK_MULTIPLIER   0x0FFFULL
 #define CFG_MASK_QUANTUM      0xFFFFULL
-#define CFG_MASK_BUDGET       0xFFFFULL
 #define CFG_MASK_STARVATION   0xFFFFFULL
 
 #define UNPACK_MULTIPLIER(cfg)    ((cfg) & CFG_MASK_MULTIPLIER)
 #define UNPACK_QUANTUM_NS(cfg)    ((((cfg) >> CFG_SHIFT_QUANTUM) & CFG_MASK_QUANTUM) << 10)
-#define UNPACK_BUDGET_NS(cfg)     ((((cfg) >> CFG_SHIFT_BUDGET) & CFG_MASK_BUDGET) << 10)
 #define UNPACK_STARVATION_NS(cfg) (((cfg) >> CFG_SHIFT_STARVATION) << 10)
 
-#define PACK_CONFIG(q_kns, mult, budget_kns, starv_kns) \
+#define PACK_CONFIG(q_kns, mult, starv_kns) \
     ((((u64)(mult) & CFG_MASK_MULTIPLIER) << CFG_SHIFT_MULTIPLIER) | \
      (((u64)(q_kns) & CFG_MASK_QUANTUM) << CFG_SHIFT_QUANTUM) | \
-     (((u64)(budget_kns) & CFG_MASK_BUDGET) << CFG_SHIFT_BUDGET) | \
      (((u64)(starv_kns) & CFG_MASK_STARVATION) << CFG_SHIFT_STARVATION))
 
 #define CAKE_FUTEX_OP_UNSET  0xFF

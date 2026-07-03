@@ -181,21 +181,27 @@ impl Profile {
         }
     }
 
-    fn wait_budget(&self) -> [u64; 8] {
-        match self {
-            Profile::Esports => [50_000, 1_000_000, 4_000_000, 0, 0, 0, 0, 0],
-            Profile::Default => [100_000, 2_000_000, 8_000_000, 0, 0, 0, 0, 0],
-            // Sim: T0/T1 wait budgets match Default (audio/input unchanged),
-            // T2 budget loosened to match Legacy (longer frame times tolerated),
-            // T3 budget 0 — simulation threads should not be debt-throttled.
-            Profile::Sim => [100_000, 2_000_000, 16_000_000, 0, 0, 0, 0, 0],
-        }
-    }
+    // FIX (audit/F-03): wait_budget() removed. It computed distinct,
+    // deliberately profile-tuned per-tier "wait budget" values (Esports:
+    // 50µs/1ms/4ms; Default: 100µs/2ms/8ms; Sim: 100µs/2ms/16ms; T3 always
+    // 0) that were packed into tier_configs and transmitted to BPF RODATA —
+    // but UNPACK_BUDGET_NS was never called by any BPF code path, confirmed
+    // by exhaustive grep across imperator_bpf.c and lock_bpf.c. No design
+    // rationale for what the field was meant to drive existed anywhere in
+    // the codebase (unlike sleep_entry_time or dsq_hint, both of which had
+    // full mechanism writeups this audit could restore). Rather than guess
+    // at unspecified scheduling behavior and add a new, unvalidated hot-path
+    // mechanism to a codebase whose own history (see intf.h's tier_perf_target
+    // / T2 DVFS note) already shows what happens when a tuning value ships
+    // without this project's normal A/B validation, the field and its BPF-side
+    // plumbing (CFG_SHIFT_BUDGET / CFG_MASK_BUDGET / UNPACK_BUDGET_NS /
+    // CAKE_DEFAULT_WAIT_BUDGET_* in intf.h) have been removed. Starvation has
+    // been repacked down to bit 28 to reclaim the freed range rather than
+    // leave a hole in tier_configs — see intf.h's fused_config_t comment.
 
     fn tier_configs(&self, quantum_us: u64, starvation_override: Option<u64>) -> [u64; 8] {
         let base_starvation = self.starvation_threshold();
         let multiplier = self.tier_multiplier();
-        let budget = self.wait_budget();
 
         let starvation: [u64; 8] = if let Some(cli_us) = starvation_override {
             let cli_ns = cli_us * 1000;
@@ -214,8 +220,7 @@ impl Profile {
             let quantum_kns = (quantum_us * 1000) >> 10;
             configs[i] = (multiplier[i] as u64 & 0xFFF)
                 | ((quantum_kns & 0xFFFF) << 12)
-                | (((budget[i] >> 10) & 0xFFFF) << 28)
-                | (((starvation[i] >> 10) & 0xFFFFF) << 44);
+                | (((starvation[i] >> 10) & 0xFFFFF) << 28);
         }
         configs
     }

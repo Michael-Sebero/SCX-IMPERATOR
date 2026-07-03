@@ -258,29 +258,31 @@ UEI_DEFINE(uei);
  * dispatch queues but never referenced after the per-LLC DSQ migration.
  * Zero call sites confirmed by static analysis. */
 
-/* Tier config table - 4 tiers + padding, AoS layout: single cache line fetch */
+/* Tier config table - 4 tiers + padding, AoS layout: single cache line fetch
+ * FIX (audit/F-03): PACK_CONFIG's budget_kns argument removed — see intf.h
+ * for the full rationale for removing the wait-budget field entirely. */
 const fused_config_t tier_configs[8] = {
     /* T0: Critical (<100µs) — IRQ, input, audio */
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T0,
-                CAKE_DEFAULT_WAIT_BUDGET_T0 >> 10, CAKE_DEFAULT_STARVATION_T0 >> 10),
+                CAKE_DEFAULT_STARVATION_T0 >> 10),
     /* T1: Interactive (<2ms) — compositor, physics */
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T1,
-                CAKE_DEFAULT_WAIT_BUDGET_T1 >> 10, CAKE_DEFAULT_STARVATION_T1 >> 10),
+                CAKE_DEFAULT_STARVATION_T1 >> 10),
     /* T2: Frame Producer (<8ms) — game render, encoding */
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T2,
-                CAKE_DEFAULT_WAIT_BUDGET_T2 >> 10, CAKE_DEFAULT_STARVATION_T2 >> 10),
+                CAKE_DEFAULT_STARVATION_T2 >> 10),
     /* T3: Bulk (≥8ms) — compilation, background */
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T3,
-                CAKE_DEFAULT_WAIT_BUDGET_T3 >> 10, CAKE_DEFAULT_STARVATION_T3 >> 10),
+                CAKE_DEFAULT_STARVATION_T3 >> 10),
     /* Padding (copies of T3 for safe & 7 access) */
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T3,
-                CAKE_DEFAULT_WAIT_BUDGET_T3 >> 10, CAKE_DEFAULT_STARVATION_T3 >> 10),
+                CAKE_DEFAULT_STARVATION_T3 >> 10),
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T3,
-                CAKE_DEFAULT_WAIT_BUDGET_T3 >> 10, CAKE_DEFAULT_STARVATION_T3 >> 10),
+                CAKE_DEFAULT_STARVATION_T3 >> 10),
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T3,
-                CAKE_DEFAULT_WAIT_BUDGET_T3 >> 10, CAKE_DEFAULT_STARVATION_T3 >> 10),
+                CAKE_DEFAULT_STARVATION_T3 >> 10),
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T3,
-                CAKE_DEFAULT_WAIT_BUDGET_T3 >> 10, CAKE_DEFAULT_STARVATION_T3 >> 10),
+                CAKE_DEFAULT_STARVATION_T3 >> 10),
 };
 
 /* Per-tier graduated backoff recheck masks (RODATA)
