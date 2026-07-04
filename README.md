@@ -9,7 +9,7 @@
 > - **Waker Tier Inheritance** High-priority task waking a lower-priority one lifts the wakee's tier, keeping producer-consumer chains tight
 > - **Lock-Holder Protection** Futex holders get scheduling priority and starvation skips to release locks faster, unblocking waiters sooner
 > - **ETD Calibration** Startup CAS ping-pong measures actual inter-core latency; cross-LLC work stealing tries the empirically-cheapest LLC first, falling back to index order before calibration completes
-> - **Dispatch Latency Telemetry** Every task tracks its own scheduling latency (enqueue-to-dispatch) as a per-task EWMA; mean dispatch latency is shown live in the TUI summary bar and clipboard export
+> - **Dispatch Latency Telemetry** Every task tracks its own scheduling latency (enqueue-to-dispatch) as a per-task EWMA; mean dispatch latency is shown live in the TUI summary bar and clipboard export, or logged periodically in headless mode via `--stats`
 > - **Preemption Burst Credit** T1/T2 tasks repeatedly interrupted before completing their quantum earn slice extensions proportional to how many times they were cut short
 > - **Desktop-First DVFS** Every tier runs at full CPU clock by default no power-saving throttle on background work since `scx_imperator` targets mains-powered desktops, not laptops or thermally-constrained systems
 
@@ -42,6 +42,9 @@ chmod 755 /bin/scx_imperator
 
 # Run (requires root) — uses the Default profile, tuned for desktop gaming
 sudo scx_imperator
+
+# Same as above — "gaming" is an accepted alias for the Default profile
+sudo scx_imperator -p gaming
 
 # Competitive/esports profile — tightest worst-case latency, more context-switch overhead
 sudo scx_imperator -p esports
@@ -135,6 +138,8 @@ Every task records a timestamp when it enters the dispatch queue (`enqueue_time`
 
 Each context switch accumulates the current EWMA sample into two per-CPU counters (`nr_jitter_ewma_sum`, `nr_jitter_ewma_count`) in `imperator_stats`. The TUI aggregates these across all CPUs and displays the mean dispatch latency live in the summary bar (`Dispatch latency: Xµs`) and in the clipboard export under `C2-Infra Dispatch latency telemetry`.
 
+Collection itself (`enable_stats`) used to require launching the interactive TUI via `-v`/`--verbose` — a headless deployment (e.g. under systemd) had no way to turn it on and got zero visibility into any of this. `--stats`/`-s` now enables the same collection independently of the TUI: a summary line, including mean dispatch latency, is logged roughly every 60 seconds, and the raw per-CPU counters remain readable via `bpftool map dump` on the scheduler's `bss` map for anyone who wants them directly. `--stats` is implied by `--verbose` and harmless (redundant) alongside it.
+
 The signal resets on exec and fork, and is skipped for tasks dispatched via the SYNC or idle-direct fast paths (which bypass the queue entirely and have no meaningful wait time to record). On pure SYNC workloads the counter stays at zero and the TUI shows `—` rather than a misleading value.
 
 ### Preemption Burst Credit
@@ -194,6 +199,7 @@ select_cpu
 
 enqueue
   ├── stamp enqueue_time for dispatch latency measurement
+  ├── sleep_entry_time set?  → pull avg_runtime toward tier midpoint if slept >500ms (post-sleep recovery)
   ├── SCX_ENQ_PREEMPT + T1/T2? → accumulate burst_credit (up to per-tier cap)
   ├── burst_credit > 0? → extend slice by credit amount, zero credit
   ├── IRQ_WAKE flag     → tier = T0 (one-shot, consumed here)
@@ -275,7 +281,7 @@ When a T0 or T1 task is enqueued into a full LLC, a victim CPU in the same LLC i
 ## 8. Overhead
 
 > [!NOTE]
-> The figures below were measured against an earlier revision and have not been re-profiled since. Several features added later in this scheduler's history (ETD-aware steal ordering, the M-2 mailbox-consistency fix, the live `tier_configs`-coupled burst-credit ceiling) touch the functions listed here; their cost is believed small but is not reflected in the numbers below. Treat this table as directionally useful, not as a current measurement.
+> The figures below were measured against an earlier revision and have not been re-profiled since. Several features added later in this scheduler's history (ETD-aware steal ordering, the M-2 mailbox-consistency fix, the live `tier_configs`-coupled burst-credit ceiling, the post-sleep recovery check moving from `stopping` to `enqueue`) touch the functions listed here; their cost is believed small but is not reflected in the numbers below. Treat this table as directionally useful, not as a current measurement.
 
 The added cost relative to a minimal sched_ext skeleton is approximately 20%, concentrated in `select_cpu` and `enqueue`. The cycle counts below predate the ETD-aware steal-ordering feature in `dispatch` (see [§7](#7-work-stealing--topology)) and have not been re-measured since; treat the `dispatch` row as **not current** rather than as a measured zero.
 
@@ -314,7 +320,7 @@ All new fields (`enqueue_time`, `jitter_ewma_us`, `burst_credit`) sit on the sam
 
 | Term | Definition |
 | :--- | :--- |
-| **Fused Config** | 4 parameters packed into one 64-bit word: `[mult:12][quantum:16][budget:16][starve:20]`. |
+| **Fused Config** | 3 parameters packed into one 64-bit word: `[mult:12][quantum:16][starve:20]`, with 16 bits reserved. A `budget` field previously occupied bits 28–43 but was never read by any scheduling decision; it was removed and `starve` repacked down into the freed range rather than leaving a gap. |
 | **Mega-Mailbox** | 64B per-CPU cache-line-isolated state. Carries tier information for waker inheritance with zero false sharing. |
 | **Graduated Backoff** | Confidence system that reduces reclassification frequency once a task's tier has been stable for 3+ stops. |
 | **Vtime** | Virtual timestamp used as the DSQ sort key: `(tier << 56) | timestamp`. Encodes both priority and arrival order. |
