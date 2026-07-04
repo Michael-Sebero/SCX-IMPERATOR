@@ -43,9 +43,6 @@ chmod 755 /bin/scx_imperator
 # Run (requires root) — uses the Default profile, tuned for desktop gaming
 sudo scx_imperator
 
-# Same as above — "gaming" is an accepted alias for the Default profile
-sudo scx_imperator -p gaming
-
 # Competitive/esports profile — tightest worst-case latency, more context-switch overhead
 sudo scx_imperator -p esports
 ```
