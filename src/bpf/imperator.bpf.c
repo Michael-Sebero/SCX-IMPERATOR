@@ -108,8 +108,8 @@ const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};
  * CPUs where these fields are not meaningful. */
 const u32 cpu_core_id[CAKE_MAX_CPUS] = {};
 const u32 cpu_thread_bit[CAKE_MAX_CPUS] = {};
-const u64 core_cpu_mask[32] = {};
-const u32 core_thread_mask[32] = {};
+const u64 core_cpu_mask[CAKE_MAX_CPUS] = {};
+const u32 core_thread_mask[CAKE_MAX_CPUS] = {};
 const u32 threads_per_ccd = 0;
 
 /* [A] llc_cpu_mask — BSS, computed by imperator_init from cpu_llc_id RODATA.
@@ -712,7 +712,7 @@ s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
                 /* Check whether the full physical core is idle.
                  * core_id is u32; guard against array bounds. */
                 u32 core_id = cpu_core_id[pcpu & (CAKE_MAX_CPUS - 1)];
-                if (core_id < 32 && core_cpu_mask[core_id] != 0) {
+                if (core_id < CAKE_MAX_CPUS && core_cpu_mask[core_id] != 0) {
                     /* SMT-aware fully-idle check:
                      * core_cpu_mask[core_id] = bitmask of all logical CPUs in
                      *   this physical core (all thread slots).
@@ -723,7 +723,7 @@ s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
                      * (not in the idle candidate set) — treat as fully-idle:
                      * the task gets the whole P-core to itself. */
                     u64 cmask = core_cpu_mask[core_id];
-                    u8  tmask = (u8)core_thread_mask[core_id & 31];
+                    u8  tmask = (u8)core_thread_mask[core_id & (CAKE_MAX_CPUS - 1)];
                     u32 my_thread_bit = cpu_thread_bit[pcpu & (CAKE_MAX_CPUS - 1)];
                     /* Sibling slots = all core slots except this CPU's own slot */
                     u64 sibling_bits = cmask & ~(1ULL << pcpu);
@@ -1102,6 +1102,26 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
         u64 max_slice = (quantum_ns * t2_mult) >> 10;
         u64 ext_slice = slice + bonus_ns;
         slice = (ext_slice < max_slice) ? ext_slice : max_slice;
+
+        /* FIX (Weakness-1 / next_slice-credit-sync): propagate the extension
+         * into next_slice, not just the local `slice` used for this
+         * dispatch's scx_bpf_dsq_insert_vtime() call below. Without this,
+         * imperator_tick's forced-preemption check — `runtime >
+         * tctx_reg->next_slice`, unconditional, unaware of anything computed
+         * here — would still fire at the tier's un-extended boundary,
+         * kicking the task at roughly its original quantum regardless of the
+         * longer slice nominally granted here. That defeated the entire
+         * point of burst credit: a repeatedly-preempted task earned and
+         * "spent" credit that never changed when it actually got kicked.
+         *
+         * Safe against compounding across bouts: reclassify_task_cold now
+         * unconditionally recomputes next_slice back to the tier's natural
+         * baseline at the end of every bout (see the "SLICE RECALCULATION"
+         * block there), so this extension applies to exactly the one bout
+         * being dispatched right now and never carries forward into the
+         * next enqueue's baseline or leaks into a later direct-dispatch
+         * bout via consume_irq_wake_get_tier_slice(). */
+        tctx_reg->next_slice = slice;
         tctx_reg->burst_credit = 0;
 
         if (enable_stats) {
@@ -1143,13 +1163,28 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
      * LAVD propagates latency criticality through task graphs via
      * lat_cri_waker/lat_cri_wakee fields. CAKE's simpler equivalent: when
      * a high-priority task wakes a lower-priority task, temporarily promote
-     * the wakee to at most (waker_tier + 1).
+     * the wakee to exactly the waker's tier, floored at CAKE_TIER_INTERACT
+     * (T1) so an ordinary wakeup can never grant full T0. See the FIX
+     * (audit) comment at the promotion formula below for the complete
+     * policy and worked examples.
+     *
+     * FIX (Weakness-2 / stale-summary): this paragraph used to say "at most
+     * (waker_tier + 1)" — a formula this function stopped using well before
+     * this correction (see the FIX (audit) comment below). The two formulas
+     * coincide only at waker_tier == CAKE_TIER_CRITICAL, since 0 + 1 == 1 ==
+     * the T1 floor — which happens to be the exact case the rationale below
+     * uses as its example, so this paragraph read as correct for that one
+     * illustration while being wrong for every other waker tier (e.g. a T1
+     * waker: old formula promotes the wakee to T2, current policy to T1).
      *
      * Rationale for gaming: a T0 input handler wakes the game's event
-     * dispatcher (T2) — without promotion, the event dispatcher sits in
-     * the T2 queue for up to 40ms. With promotion it runs in the T1 queue
-     * for this dispatch, and its EWMA will naturally converge to T1 within
-     * a few bouts if the pattern is consistent.
+     * dispatcher (T2). Without promotion it sits in the T2 queue until T2's
+     * starvation threshold elapses — profile-dependent, see tier_configs[]
+     * / Profile::starvation_threshold() in main.rs for the live number
+     * rather than a figure hardcoded here, which is exactly how the "+1"
+     * paragraph above went stale unnoticed. With promotion it runs in the
+     * T1 queue for this dispatch instead, and its EWMA will naturally
+     * converge to T1 within a few bouts if the pattern is consistent.
      *
      * Cost: one BSS L1 read (mega_mailbox[enq_cpu].flags, already in L1
      * from any recent imperator_tick on this CPU) + one comparison + one branch.
@@ -1157,7 +1192,12 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
      *
      * Constraints:
      *   - Only on SCX_ENQ_WAKEUP (producer→consumer, not preempt or yield).
-     *   - Never promotes above CAKE_TIER_CRITICAL (floor is 0).
+     *   - Never promotes to CAKE_TIER_CRITICAL (T0) — the achievable floor is
+     *     CAKE_TIER_INTERACT (T1). Genuine T0 is reserved for the IRQ-wake
+     *     boost path (Feature 1, CAKE_FLOW_IRQ_WAKE), not this one. (This
+     *     bullet previously said "floor is 0" — left over from before the
+     *     T1 floor existed, and had gone stale in the same way as the
+     *     summary paragraph above.)
      *   - Never demotes: if the wakee is already T0, this is a no-op.
      *   - One-dispatch only: does not alter packed_info, so EWMA is unaffected.
      *   - Only when mailbox valid flag is set: mega_mailbox flags are zero-
@@ -1200,16 +1240,20 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
             if (waker_tier < tier) {
                 /* FIX (audit): Previous formula was waker_tier + 1, which meant a T1
                  * waker promoted a T3 wakee only to T2, not T1.  On a 4ms frame budget
-                 * a T2 wakee (40ms starvation threshold) could still delay the event
-                 * dispatcher by an entire frame.
+                 * a T2 wakee could still be delayed by an entire frame under the old
+                 * formula, up to T2's starvation threshold.
                  *
                  * New policy: promote wakee to exactly waker_tier, but never to T0
                  * (CRITICAL) for ordinary wakeups — that tier is reserved for hardware
                  * IRQ consumers (CAKE_FLOW_IRQ_WAKE path).  A T0 audio waker therefore
                  * promotes the game's event dispatcher to T1 directly rather than T2,
-                 * cutting its maximum dispatch latency from 40ms to 8ms (Gaming T1
-                 * starvation threshold).  A T1 compositor waking a T2 render thread
-                 * promotes it to T1 for one dispatch, keeping the pipeline tight.
+                 * cutting its maximum dispatch latency from T2's starvation threshold
+                 * down to T1's (20ms -> 8ms at time of writing, Default profile — see
+                 * tier_configs[] / Profile::starvation_threshold() in main.rs for
+                 * current values; this comment previously hardcoded "40ms -> 8ms" and
+                 * silently went stale when Default's T2 threshold was retuned to
+                 * 20ms).  A T1 compositor waking a T2 render thread promotes it to T1
+                 * for one dispatch, keeping the pipeline tight.
                  *
                  * Floor at CAKE_TIER_INTERACT (1): prevents T0-wakers from erroneously
                  * giving T0 to arbitrary wakees through the inheritance path.  Genuine
@@ -2155,13 +2199,43 @@ void reclassify_task_cold(struct imperator_task_ctx *tctx)
         imperator_relaxed_store_u32(&tctx->packed_info, new_packed);
     }
 
-    /* ── SLICE RECALCULATION on tier change ── */
-    /* When tier changes, the quantum multiplier changes (T0=0.75x → T3=1.4x).
-     * Update next_slice so the next execution bout uses the correct quantum. */
-    if (tier_changed) {
+    /* ── SLICE RECALCULATION (every bout, not just on tier change) ──
+     * FIX (Weakness-1 / next_slice-credit-sync): this used to run only
+     * inside `if (tier_changed)`, which was correct as long as nothing else
+     * ever wrote next_slice mid-tier. That stopped being true once
+     * imperator_enqueue's burst-credit consumption block started writing an
+     * extended value into next_slice for the current bout (see that block,
+     * below the "FIX (Weakness-1 / next_slice-credit-sync)" comment there).
+     *
+     * Left gated on tier_changed, a same-tier task would carry the extended
+     * value forward as its new "baseline": the next imperator_enqueue call
+     * seeds its local `slice` from next_slice, so a second earned credit
+     * would stack on top of the still-extended value instead of the tier's
+     * true baseline — and any bout dispatched via the direct-dispatch path
+     * (consume_irq_wake_get_tier_slice, which reads next_slice directly and
+     * never runs imperator_enqueue) would inherit an extension it never
+     * earned. imperator_tick's own forced-preemption check reads next_slice
+     * too, so either case also means the wrong bout gets the wrong
+     * preemption boundary.
+     *
+     * Recomputing unconditionally — using new_tier, which equals old_tier
+     * when the tier didn't change — restores next_slice to the tier's
+     * natural, un-extended baseline at the end of every bout, right before
+     * the task's next wakeup. imperator_enqueue is then free to extend it
+     * again for exactly one bout at a time, and it can never compound.
+     * When the tier didn't change this computes the identical value as
+     * before (quantum_ns and tier_configs[] don't change mid-session), so
+     * there is no behavioral change on the non-burst-credit path — the only
+     * cost is one redundant multiply+shift on an already-cold path (this
+     * function runs once per bout at imperator_stopping, nowhere near the
+     * per-tick or per-enqueue hot path). */
+    {
         u64 cfg = tier_configs[CAKE_TIER_IDX(new_tier)];
         u64 mult = UNPACK_MULTIPLIER(cfg);
         tctx->next_slice = (quantum_ns * mult) >> 10;
+    }
+
+    if (tier_changed) {
         tctx->reclass_counter = 0;
 
         /* FIX (audit/Finding-9): Zero burst_credit on demotion.

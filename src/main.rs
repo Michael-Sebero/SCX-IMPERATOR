@@ -437,10 +437,10 @@ impl<'a> Scheduler<'a> {
             for (i, &v) in topo.cpu_thread_bit.iter().enumerate().take(64) {
                 rodata.cpu_thread_bit[i] = v as u32;
             }
-            for (i, &v) in topo.core_cpu_mask.iter().enumerate().take(32) {
+            for (i, &v) in topo.core_cpu_mask.iter().enumerate().take(64) {
                 rodata.core_cpu_mask[i] = v;
             }
-            for (i, &v) in topo.core_thread_mask.iter().enumerate().take(32) {
+            for (i, &v) in topo.core_thread_mask.iter().enumerate().take(64) {
                 rodata.core_thread_mask[i] = v as u32;
             }
             rodata.threads_per_ccd  = topo.threads_per_ccd;

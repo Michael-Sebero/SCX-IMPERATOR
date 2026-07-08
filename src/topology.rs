@@ -32,9 +32,19 @@ pub struct TopologyInfo {
     pub cpu_core_id: [u8; MAX_CPUS],
     pub cpu_thread_bit: [u8; MAX_CPUS],
     /// Pre-computed 64-bit mask of all CPUs in a physical core
-    pub core_cpu_mask: [u64; 32],
+    // FIX (Weakness-3): widened from [_; 32] to [_; MAX_CPUS]. These were the
+    // only two topology arrays indexed by *physical core ID* rather than
+    // logical CPU ID, and they'd been left at a 32-entry cap while every
+    // logical-CPU-indexed array (cpu_core_id, cpu_thread_bit, etc.) already
+    // used the full MAX_CPUS=64. On a >32-physical-core system with SMT off
+    // (still within the supported 64-logical-CPU envelope), core IDs above
+    // 31 were silently dropped here with no error or log. Since Gen 3 wired
+    // these into the hybrid P/E-core steering logic in imperator_bpf.c, that
+    // silent truncation stopped being dead-code trivia and became a real
+    // (if currently niche) ceiling on a live feature.
+    pub core_cpu_mask: [u64; MAX_CPUS],
     /// Bitmask requirement for a core to be "fully idle" (e.g. 0x3 for dual SMT)
-    pub core_thread_mask: [u8; 32],
+    pub core_thread_mask: [u8; MAX_CPUS],
     pub llc_cpu_mask: [u64; MAX_LLCS],
     pub big_cpu_mask: u64,
 
@@ -81,8 +91,8 @@ pub fn detect() -> Result<TopologyInfo> {
         cpu_is_big: [0; MAX_CPUS], // Reset and re-populated by P/E-core detection below
         cpu_core_id: [0; MAX_CPUS],
         cpu_thread_bit: [0; MAX_CPUS],
-        core_cpu_mask: [0; 32],
-        core_thread_mask: [0; 32],
+        core_cpu_mask: [0; MAX_CPUS],
+        core_thread_mask: [0; MAX_CPUS],
         llc_cpu_mask: [0; MAX_LLCS],
         big_cpu_mask: 0,
         threads_per_ccd: 0,
@@ -152,7 +162,7 @@ pub fn detect() -> Result<TopologyInfo> {
         }
 
         // Calculate SMT requirement mask for this core
-        if core_id < 32 {
+        if core_id < MAX_CPUS {
             info.core_thread_mask[core_id] = ((1u16 << core.cpus.len()) - 1) as u8;
         }
 
@@ -167,7 +177,7 @@ pub fn detect() -> Result<TopologyInfo> {
                 info.cpu_is_big[cpu] = is_big;
                 info.cpu_core_id[cpu] = core_id as u8;
                 info.cpu_thread_bit[cpu] = 1 << thread_idx;
-                if core_id < 32 {
+                if core_id < MAX_CPUS {
                     info.core_cpu_mask[core_id] |= 1u64 << cpu;
                 }
 
