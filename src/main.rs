@@ -274,6 +274,22 @@ struct Args {
     /// signal-wait timeout rather than a separate configurable timer.
     #[arg(long, default_value_t = 1)]
     interval: u64,
+    /// Use the exhaustive O(nr_cpus^2) ETD calibration sweep — every CPU
+    /// pair — instead of the default representative sample (a handful of
+    /// evenly-spread CPU pairs per LLC pair; see select_etd_pairs() in this
+    /// file). The exhaustive sweep leaves no sampling gaps in the latency
+    /// matrix, at the cost of a longer calibration window: every measured
+    /// pair briefly holds two CPUs under SCHED_FIFO priority 99 (see
+    /// calibrate.rs's module doc comment for why that's worth minimizing by
+    /// default), and pair count scales O(n^2) with core count rather than
+    /// O(LLC pairs). Meant for offline analysis, or checking whether
+    /// representative sampling is missing something on a specific system's
+    /// topology — not for routine use. No effect on systems with 0 or 1
+    /// populated LLCs: calibration is always skipped entirely there
+    /// regardless of this flag, since try_write_etd_costs() never reads any
+    /// entry either sweep would produce in that case.
+    #[arg(long)]
+    full_etd_sweep: bool,
 }
 
 impl Args {
@@ -305,6 +321,91 @@ impl Drop for Scheduler<'_> {
     }
 }
 
+/// FIX (Weakness-4 / etd-sampling): choose a small, representative set of
+/// cross-LLC CPU pairs for ETD calibration instead of measuring every CPU
+/// pair in the system.
+///
+/// try_write_etd_costs() (below) only ever reads cross-LLC matrix entries —
+/// same-LLC entries are explicitly skipped there — and reduces every LLC
+/// pair down to one u8 via the minimum across whatever entries got measured
+/// for it. Measuring same-LLC pairs is therefore pure waste, provably never
+/// consumed, and inter-core latency across an LLC pair is governed by which
+/// two physical domains (CCDs/CCXs/sockets) the two CPUs sit in, not by
+/// which specific core within each domain — so a handful of well-spread
+/// samples per LLC pair characterizes it about as well as an exhaustive
+/// sweep would, at a fraction of the cost.
+///
+/// That cost is the actual point: every measured pair spends its full
+/// warmup+measurement window with two CPUs pinned under SCHED_FIFO priority
+/// 99, unavailable to any non-RT task — including a game thread that
+/// happens to land on one of them — for that window. The number of pairs
+/// this function returns is what bounds how long that exposure lasts in
+/// total and how many distinct CPUs it ever touches.
+///
+/// Returns an empty Vec when there's nothing worth measuring: fewer than two
+/// populated LLCs (single-CCD/single-CCX desktops — the common case,
+/// including every part with a single monolithic die) means every matrix
+/// entry try_write_etd_costs() would ever read stays at its default
+/// "uncalibrated" value no matter what calibration measures. The caller
+/// skips spawning the calibration thread entirely in that case, removing
+/// the RT-priority exposure altogether rather than just shrinking it.
+///
+/// This function isn't the only way to get a latency matrix: `--full-etd-sweep`
+/// bypasses it entirely in favor of calibrate_full_matrix()'s exhaustive
+/// C(nr_cpus, 2) sweep, for anyone who wants that trade-off instead.
+fn select_etd_pairs(topo: &topology::TopologyInfo) -> Vec<(usize, usize)> {
+    // Samples per LLC pair. 3 mirrors the min-of-several robustness the old
+    // exhaustive sweep got "for free" from having dozens of candidate pairs
+    // per LLC pair to take a minimum over, without needing anywhere near
+    // that many measurements to get it.
+    const SAMPLES_PER_LLC_PAIR: usize = 3;
+
+    let llc_members: Vec<Vec<usize>> = topo
+        .llc_cpu_mask
+        .iter()
+        .filter(|&&mask| mask != 0)
+        .map(|&mask| {
+            (0..topology::MAX_CPUS)
+                .filter(|&cpu| mask & (1u64 << cpu) != 0)
+                .collect()
+        })
+        .collect();
+
+    if llc_members.len() <= 1 {
+        return Vec::new();
+    }
+
+    // Spread `k` sample indices evenly across a list of length `len` —
+    // spread_indices(8, 3) == [0, 3, 7], not [0, 1, 2] — so samples don't
+    // all land on adjacent/SMT-sibling CPUs, which would share local noise
+    // characteristics rather than adding independent data points.
+    fn spread_indices(len: usize, k: usize) -> Vec<usize> {
+        if len == 0 || k == 0 {
+            return Vec::new();
+        }
+        let k = k.min(len);
+        if k == 1 {
+            return vec![0];
+        }
+        (0..k).map(|i| i * (len - 1) / (k - 1)).collect()
+    }
+
+    let mut pairs = Vec::new();
+    for a in 0..llc_members.len() {
+        for b in (a + 1)..llc_members.len() {
+            let cpus_a = &llc_members[a];
+            let cpus_b = &llc_members[b];
+            let k = SAMPLES_PER_LLC_PAIR.min(cpus_a.len()).min(cpus_b.len());
+            let idx_a = spread_indices(cpus_a.len(), k);
+            let idx_b = spread_indices(cpus_b.len(), k);
+            for i in 0..k {
+                pairs.push((cpus_a[idx_a[i]], cpus_b[idx_b[i]]));
+            }
+        }
+    }
+    pairs
+}
+
 impl<'a> Scheduler<'a> {
     fn new(
         args: Args,
@@ -322,6 +423,8 @@ impl<'a> Scheduler<'a> {
         let topo = topology::detect()?;
         let (quantum, new_flow_bonus, _) = args.effective_values();
 
+        let etd_pairs = select_etd_pairs(&topo);
+
         // ── eventfd for ETD completion notification ───────────────────────
         // The background thread writes to this fd when calibration finishes.
         // The event loop polls [signalfd, etd_efd] and shrinks to [signalfd]
@@ -329,15 +432,28 @@ impl<'a> Scheduler<'a> {
         //
         // EFD_NONBLOCK: read() returns EAGAIN instead of blocking when empty.
         // EFD_CLOEXEC:  not inherited across exec.
-        let etd_efd = unsafe {
-            libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
+        //
+        // FIX (Weakness-4): skipped entirely when etd_pairs is empty (fewer
+        // than 2 populated LLCs — see select_etd_pairs()). There's nothing
+        // for the eventfd to signal completion of, and the rest of this
+        // codebase already treats etd_efd < 0 as "no eventfd available, fall
+        // back to 60s timeout polling" (see the run() loop) — reusing that
+        // exact path here means "calibration wasn't needed" doesn't need a
+        // new code path of its own, and try_write_etd_costs() already
+        // no-ops harmlessly forever against the all-zero matrix that results.
+        let etd_efd = if etd_pairs.is_empty() {
+            info!("ETD: single populated LLC detected — skipping calibration, nothing to steal across");
+            -1i32
+        } else {
+            let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            if fd < 0 {
+                warn!(
+                    "Failed to create ETD eventfd ({}), falling back to 60s timeout polling",
+                    std::io::Error::last_os_error()
+                );
+            }
+            fd
         };
-        if etd_efd < 0 {
-            warn!(
-                "Failed to create ETD eventfd ({}), falling back to 60s timeout polling",
-                std::io::Error::last_os_error()
-            );
-        }
 
         // Duplicate the fd for the background thread (write end).
         // Scheduler owns etd_efd (read, closed in Drop).
@@ -354,40 +470,103 @@ impl<'a> Scheduler<'a> {
             -1i32
         };
 
-        info!("Starting ETD calibration in background...");
         let nr_cpus_cal = topo.nr_cpus;
         let latency_matrix = Arc::new(Mutex::new(vec![vec![0.0f64; nr_cpus_cal]; nr_cpus_cal]));
-        let matrix_bg = latency_matrix.clone();
-        let is_verbose = args.verbose;
 
-        std::thread::spawn(move || {
-            let result = calibrate::calibrate_full_matrix(
-                nr_cpus_cal,
-                &calibrate::EtdConfig::default(),
-                |current, total, is_complete| {
-                    if !is_verbose {
-                        tui::render_calibration_progress(current, total, is_complete);
-                    }
-                },
-            );
-            match matrix_bg.lock() {
-                Ok(mut m)  => *m = result,
-                Err(e)     => *e.into_inner() = result,
+        if !etd_pairs.is_empty() {
+            let full_sweep = args.full_etd_sweep;
+            let full_pair_count = (nr_cpus_cal * nr_cpus_cal.saturating_sub(1)) / 2;
+
+            if full_sweep {
+                info!(
+                    "Starting ETD calibration in background (--full-etd-sweep: exhaustive {} pairs, \
+                     not the default {} representative pairs)...",
+                    full_pair_count,
+                    etd_pairs.len()
+                );
+                // FIX (Medium-1 / full-etd-sweep-warning): --full-etd-sweep re-opts
+                // into the full O(n^2) RT-priority exposure that select_etd_pairs()'s
+                // default representative sampling exists specifically to avoid (see
+                // that function's doc comment). Each measured pair briefly holds two
+                // CPUs under SCHED_FIFO priority 99 — real-time, strictly above every
+                // sched_ext/CFS task including an already-running game — for its full
+                // warmup+measurement window. The default path keeps that exposure to
+                // a handful of pairs; this flag removes the ceiling entirely and
+                // scales it back up with core count. Warned here, at the moment it
+                // happens, rather than left to a doc comment someone may not have
+                // read before passing the flag on a scheduler restart mid-session.
+                warn!(
+                    "--full-etd-sweep: measuring {}x as many pairs as the default ({} vs {}). Each \
+                     pair briefly holds two CPUs under real-time priority (SCHED_FIFO 99), which can \
+                     preempt an already-running game on whichever CPUs are being measured at that \
+                     moment. Fine at boot before launching anything latency-sensitive; avoid pairing \
+                     this flag with a scheduler restart while a game is already running.",
+                    full_pair_count / etd_pairs.len().max(1),
+                    full_pair_count,
+                    etd_pairs.len()
+                );
+            } else {
+                info!(
+                    "Starting ETD calibration in background ({} representative pairs, not the full {}-pair \
+                     sweep — pass --full-etd-sweep for that)...",
+                    etd_pairs.len(),
+                    full_pair_count
+                );
             }
-            // Signal ETD completion.  The event loop wakes within microseconds
-            // and writes the LLC cost table — not up to 1 second later.
-            if etd_efd_write >= 0 {
-                let val: u64 = 1;
-                unsafe {
-                    libc::write(
-                        etd_efd_write,
-                        &val as *const u64 as *const libc::c_void,
-                        8,
-                    );
-                    libc::close(etd_efd_write);
+            let matrix_bg = latency_matrix.clone();
+            let is_verbose = args.verbose;
+
+            std::thread::spawn(move || {
+                // FIX (quality-focus / calibrate_full_matrix): --full-etd-sweep is
+                // what makes calibrate_full_matrix a real, reachable feature rather
+                // than dead code wearing an #[allow]. Same measure_pair() underneath
+                // either way — only the pair list differs, exactly as designed when
+                // calibrate_pairs() was factored out of it. Each branch gets its own
+                // progress-callback closure literal (rather than one shared `let`
+                // binding passed to both) to match the exact capture pattern the
+                // single-branch version already had before this flag existed —
+                // known to compile, not merely reasoned to.
+                let result = if full_sweep {
+                    calibrate::calibrate_full_matrix(
+                        nr_cpus_cal,
+                        &calibrate::EtdConfig::default(),
+                        |current, total, is_complete| {
+                            if !is_verbose {
+                                tui::render_calibration_progress(current, total, is_complete);
+                            }
+                        },
+                    )
+                } else {
+                    calibrate::calibrate_pairs(
+                        nr_cpus_cal,
+                        &etd_pairs,
+                        &calibrate::EtdConfig::default(),
+                        |current, total, is_complete| {
+                            if !is_verbose {
+                                tui::render_calibration_progress(current, total, is_complete);
+                            }
+                        },
+                    )
+                };
+                match matrix_bg.lock() {
+                    Ok(mut m)  => *m = result,
+                    Err(e)     => *e.into_inner() = result,
                 }
-            }
-        });
+                // Signal ETD completion.  The event loop wakes within microseconds
+                // and writes the LLC cost table — not up to 1 second later.
+                if etd_efd_write >= 0 {
+                    let val: u64 = 1;
+                    unsafe {
+                        libc::write(
+                            etd_efd_write,
+                            &val as *const u64 as *const libc::c_void,
+                            8,
+                        );
+                        libc::close(etd_efd_write);
+                    }
+                }
+            });
+        }
 
         // Configure BPF rodata
         if let Some(rodata) = &mut open_skel.maps.rodata_data {
@@ -769,4 +948,96 @@ fn main() -> Result<()> {
     let mut scheduler = Scheduler::new(args, &mut open_object)?;
     scheduler.run(shutdown)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod etd_pair_selection_tests {
+    use super::*;
+
+    // Pure logic, no hardware pinning/measurement involved — unlike
+    // calibrate.rs's test_measure_pair_smoke, these are fully deterministic.
+    fn zeroed_topo() -> topology::TopologyInfo {
+        topology::TopologyInfo {
+            nr_cpus: 0,
+            has_dual_ccd: false,
+            has_hybrid_cores: false,
+            smt_enabled: false,
+            cpu_sibling_map: [0; topology::MAX_CPUS],
+            cpu_llc_id: [0; topology::MAX_CPUS],
+            cpu_is_big: [0; topology::MAX_CPUS],
+            cpu_core_id: [0; topology::MAX_CPUS],
+            cpu_thread_bit: [0; topology::MAX_CPUS],
+            core_cpu_mask: [0; topology::MAX_CPUS],
+            core_thread_mask: [0; topology::MAX_CPUS],
+            llc_cpu_mask: [0; topology::MAX_LLCS],
+            big_cpu_mask: 0,
+            threads_per_ccd: 0,
+        }
+    }
+
+    #[test]
+    fn no_llcs_populated_returns_no_pairs() {
+        let topo = zeroed_topo();
+        assert!(select_etd_pairs(&topo).is_empty());
+    }
+
+    #[test]
+    fn single_llc_returns_no_pairs() {
+        // Single-CCD/single-CCX desktop — the common case. Nothing for
+        // try_write_etd_costs() to ever read regardless of what we measure,
+        // so this must skip calibration entirely, not just shrink it.
+        let mut topo = zeroed_topo();
+        topo.llc_cpu_mask[0] = 0xFF; // CPUs 0-7, one LLC
+        assert!(select_etd_pairs(&topo).is_empty());
+    }
+
+    #[test]
+    fn two_equal_llcs_get_exactly_the_sample_cap() {
+        let mut topo = zeroed_topo();
+        topo.llc_cpu_mask[0] = 0x00FF; // CPUs 0-7
+        topo.llc_cpu_mask[1] = 0xFF00; // CPUs 8-15
+        let pairs = select_etd_pairs(&topo);
+        assert_eq!(pairs.len(), 3, "expected the 3-sample cap for two same-size LLCs");
+        for &(a, b) in &pairs {
+            assert!(a < 8, "first element {a} should come from LLC 0 (CPUs 0-7)");
+            assert!((8..16).contains(&b), "second element {b} should come from LLC 1 (CPUs 8-15)");
+        }
+        // All samples distinct — spread_indices() shouldn't repeat an index.
+        let mut sorted = pairs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), pairs.len(), "samples should be distinct pairs");
+    }
+
+    #[test]
+    fn small_llc_caps_the_sample_count() {
+        // LLC 0 only has 2 CPUs — the cap must follow the smaller side, not
+        // always try for SAMPLES_PER_LLC_PAIR regardless of availability.
+        let mut topo = zeroed_topo();
+        topo.llc_cpu_mask[0] = 0b11; // CPUs 0-1
+        topo.llc_cpu_mask[1] = 0xFF00; // CPUs 8-15
+        let pairs = select_etd_pairs(&topo);
+        assert_eq!(pairs.len(), 2, "capped by the 2-CPU LLC, not the 3-sample default");
+        for &(a, b) in &pairs {
+            assert!(a < 2);
+            assert!((8..16).contains(&b));
+        }
+    }
+
+    #[test]
+    fn three_llcs_only_pairs_cross_llc_never_within() {
+        let mut topo = zeroed_topo();
+        topo.llc_cpu_mask[0] = 0x0F; // CPUs 0-3
+        topo.llc_cpu_mask[1] = 0xF0; // CPUs 4-7
+        topo.llc_cpu_mask[2] = 0x0F00; // CPUs 8-11
+        let pairs = select_etd_pairs(&topo);
+        // 3 unique LLC pairs (0,1) (0,2) (1,2), capped at min(3, 4) = 3 each.
+        assert_eq!(pairs.len(), 9);
+        for &(a, b) in &pairs {
+            let llc_of = |cpu: usize| -> usize {
+                if cpu < 4 { 0 } else if cpu < 8 { 1 } else { 2 }
+            };
+            assert_ne!(llc_of(a), llc_of(b), "pair ({a}, {b}) should cross LLCs, not stay within one");
+        }
+    }
 }

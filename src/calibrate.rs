@@ -222,9 +222,23 @@ fn measure_pair(cpu_a: usize, cpu_b: usize, config: &EtdConfig) -> Option<Vec<f6
     .ok()?
 }
 
-/// Perform full topology calibration. Returns matrix[i][j] = latency from CPU i to CPU j.
-pub fn calibrate_full_matrix<F>(
+/// Measure a caller-supplied list of CPU pairs and return a sparse
+/// nr_cpus×nr_cpus latency matrix (entries for unmeasured pairs stay 0.0).
+///
+/// FIX (Weakness-4 / etd-sampling): factored out of calibrate_full_matrix()
+/// below so a caller can measure a representative subset of pairs instead of
+/// the full C(nr_cpus, 2) sweep. measure_pair()'s CAS ping-pong / RT-priority
+/// / barrier-deadlock-avoidance mechanics are completely unchanged by this
+/// split — this only changes which pairs get fed into it, which is what
+/// actually controls how long the calibration spends with two CPUs at a time
+/// held under SCHED_FIFO priority 99. main.rs's try_write_etd_costs() reduces
+/// this matrix down to one u8 per LLC-pair via a `min()` over whichever
+/// entries are non-zero, and already skips any entry left at 0.0 — so a
+/// sparser matrix produced by measuring fewer pairs is consumed identically
+/// to a dense one; nothing downstream of this function needed to change.
+pub fn calibrate_pairs<F>(
     nr_cpus: usize,
+    pairs: &[(usize, usize)],
     config: &EtdConfig,
     mut progress_callback: F,
 ) -> Vec<Vec<f64>>
@@ -234,87 +248,82 @@ where
     let mut matrix = vec![vec![0.0; nr_cpus]; nr_cpus];
 
     info!(
-        "ETD: Starting calibration for {} CPUs ({} iterations × {} samples)",
-        nr_cpus, config.iterations, config.samples
+        "ETD: Starting calibration for {} CPU pairs ({} iterations × {} samples)",
+        pairs.len(), config.iterations, config.samples
     );
 
     let start = std::time::Instant::now();
-
-    // Calculate total pairs to measure
-    let total_pairs = (nr_cpus * (nr_cpus - 1)) / 2;
+    let total_pairs = pairs.len();
     let mut current_pair = 0;
 
-    #[allow(clippy::needless_range_loop)]
-    for cpu_a in 0..nr_cpus {
-        for cpu_b in (cpu_a + 1)..nr_cpus {
-            current_pair += 1;
-            let mut retry_count = 0;
-            const MAX_RETRIES: u32 = 3;
+    for &(cpu_a, cpu_b) in pairs {
+        current_pair += 1;
+        let mut retry_count = 0;
+        const MAX_RETRIES: u32 = 3;
 
-            while let Some(samples) = measure_pair(cpu_a, cpu_b, config) {
-                let n = samples.len() as f64;
-                let mean = samples.iter().sum::<f64>() / n;
-                let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
-                let stddev = variance.sqrt();
+        while let Some(samples) = measure_pair(cpu_a, cpu_b, config) {
+            let n = samples.len() as f64;
+            let mean = samples.iter().sum::<f64>() / n;
+            let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+            let stddev = variance.sqrt();
 
-                // Check if variance is acceptable (no IRQ interference)
-                if stddev <= config.max_stddev || retry_count >= MAX_RETRIES {
-                    // Use median for final value (more robust than mean)
-                    let mut sorted = samples;
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    let median = sorted[sorted.len() / 2];
+            // Check if variance is acceptable (no IRQ interference)
+            if stddev <= config.max_stddev || retry_count >= MAX_RETRIES {
+                // Use median for final value (more robust than mean)
+                let mut sorted = samples;
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let median = sorted[sorted.len() / 2];
 
-                    matrix[cpu_a][cpu_b] = median;
-                    matrix[cpu_b][cpu_a] = median;
+                matrix[cpu_a][cpu_b] = median;
+                matrix[cpu_b][cpu_a] = median;
 
-                    if stddev > config.max_stddev {
-                        debug!(
-                            "ETD: CPU {}<->{} stddev={:.1}ns (exceeded threshold after {} retries)",
-                            cpu_a, cpu_b, stddev, retry_count
-                        );
-                    }
-
-                    break;
-                } else {
-                    retry_count += 1;
+                if stddev > config.max_stddev {
                     debug!(
-                        "ETD: CPU {}<->{} stddev={:.1}ns > {:.1}ns, retrying ({}/{})",
-                        cpu_a, cpu_b, stddev, config.max_stddev, retry_count, MAX_RETRIES
+                        "ETD: CPU {}<->{} stddev={:.1}ns (exceeded threshold after {} retries)",
+                        cpu_a, cpu_b, stddev, retry_count
                     );
                 }
-            }
 
-            // FIX (#1): When measure_pair() returns None (affinity pinning denied),
-            // the while-let body never executes and the matrix entries stay at 0.0.
-            // A 0.0 entry is the smallest possible latency value and will always win
-            // the ETD work-stealing comparison, permanently routing steals to the
-            // failed pair regardless of actual topology distance.  Fill with a large
-            // sentinel (500 ns covers worst-case cross-NUMA on Threadripper/EPYC) so
-            // the pair is treated as expensive rather than free.
-            //
-            // FIX (#5): progress_callback was only called inside the while-let body
-            // (success path).  An affinity failure silently skips the callback,
-            // leaving the TUI progress counter stuck.  Move the call here so it fires
-            // unconditionally after every pair — whether the measurement succeeded,
-            // hit max retries, or the threads could not be pinned.
-            if matrix[cpu_a][cpu_b] == 0.0 {
-                const ETD_FALLBACK_NS: f64 = 500.0;
-                matrix[cpu_a][cpu_b] = ETD_FALLBACK_NS;
-                matrix[cpu_b][cpu_a] = ETD_FALLBACK_NS;
-                warn!(
-                    "ETD: CPU {}<->{} affinity/measurement failed, using fallback {:.0}ns",
-                    cpu_a, cpu_b, ETD_FALLBACK_NS
+                break;
+            } else {
+                retry_count += 1;
+                debug!(
+                    "ETD: CPU {}<->{} stddev={:.1}ns > {:.1}ns, retrying ({}/{})",
+                    cpu_a, cpu_b, stddev, config.max_stddev, retry_count, MAX_RETRIES
                 );
             }
-            progress_callback(current_pair, total_pairs, false);
         }
+
+        // FIX (#1): When measure_pair() returns None (affinity pinning denied),
+        // the while-let body never executes and the matrix entries stay at 0.0.
+        // A 0.0 entry is the smallest possible latency value and will always win
+        // the ETD work-stealing comparison, permanently routing steals to the
+        // failed pair regardless of actual topology distance.  Fill with a large
+        // sentinel (500 ns covers worst-case cross-NUMA on Threadripper/EPYC) so
+        // the pair is treated as expensive rather than free.
+        //
+        // FIX (#5): progress_callback was only called inside the while-let body
+        // (success path).  An affinity failure silently skips the callback,
+        // leaving the TUI progress counter stuck.  Move the call here so it fires
+        // unconditionally after every pair — whether the measurement succeeded,
+        // hit max retries, or the threads could not be pinned.
+        if matrix[cpu_a][cpu_b] == 0.0 {
+            const ETD_FALLBACK_NS: f64 = 500.0;
+            matrix[cpu_a][cpu_b] = ETD_FALLBACK_NS;
+            matrix[cpu_b][cpu_a] = ETD_FALLBACK_NS;
+            warn!(
+                "ETD: CPU {}<->{} affinity/measurement failed, using fallback {:.0}ns",
+                cpu_a, cpu_b, ETD_FALLBACK_NS
+            );
+        }
+        progress_callback(current_pair, total_pairs, false);
     }
 
     // Final progress update to signal completion
     progress_callback(total_pairs, total_pairs, true);
 
     let elapsed = start.elapsed();
-    info!("ETD: Calibration complete in {:.2}s", elapsed.as_secs_f64());
+    info!("ETD: Calibration complete in {:.2}s ({} pairs)", elapsed.as_secs_f64(), total_pairs);
 
     // Log the matrix for debugging
     debug!("ETD: Latency matrix (ns):");
@@ -327,6 +336,39 @@ where
     }
 
     matrix
+}
+
+/// Exhaustive all-pairs calibration: measures every C(nr_cpus, 2) pair.
+///
+/// The scheduler's default startup path uses select_etd_pairs() + a much
+/// smaller representative sample instead (see calibrate_pairs() above and
+/// its doc comment for why). This function is reachable via the
+/// `--full-etd-sweep` CLI flag in main.rs, for anyone who wants the
+/// exhaustive sweep — offline analysis, or checking whether representative
+/// sampling is missing something on a specific system's topology — at the
+/// cost of a longer calibration window under SCHED_FIFO priority 99.
+///
+/// FIX (quality-focus): previously this function had no caller anywhere in
+/// the crate and carried an `#[allow(dead_code)]` to keep `cargo build
+/// --release` clean — technically correct (the warning was accurate: it
+/// really was unused), but that suppressed the symptom rather than giving
+/// the function a real reason to exist. `--full-etd-sweep` is that reason;
+/// the allow is gone because the warning it silenced no longer fires.
+pub fn calibrate_full_matrix<F>(
+    nr_cpus: usize,
+    config: &EtdConfig,
+    progress_callback: F,
+) -> Vec<Vec<f64>>
+where
+    F: FnMut(usize, usize, bool),
+{
+    let mut pairs = Vec::with_capacity((nr_cpus * nr_cpus.saturating_sub(1)) / 2);
+    for cpu_a in 0..nr_cpus {
+        for cpu_b in (cpu_a + 1)..nr_cpus {
+            pairs.push((cpu_a, cpu_b));
+        }
+    }
+    calibrate_pairs(nr_cpus, &pairs, config, progress_callback)
 }
 
 #[cfg(test)]

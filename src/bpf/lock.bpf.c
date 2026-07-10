@@ -46,15 +46,53 @@
  *   since the flag is a single bit.
  * - CAKE_FLAG_LOCK_HOLDER is never explicitly cleared on task death because
  *   the task context itself is freed; there is no stale-flag risk.
- * - FUTEX_CMP_REQUEUE_PI transfers lock ownership to a new task without the
- *   new owner ever calling futex_wait or futex_lock_pi.  Neither the fexit
- *   probes nor the tracepoint fallback cover this implicit grant, so the new
- *   owner's CAKE_FLAG_LOCK_HOLDER is not set until its next explicit
- *   futex_wait or futex_lock_pi call.  This is uncommon (primarily glibc
- *   condition variables with priority ceiling, rare in Wine/Proton) and
- *   represents a missed optimisation for a single-frame window, not a
- *   correctness failure.  A future fexit probe on futex_requeue() on the
- *   WAKING side would close this gap.
+ * - FUTEX_CMP_REQUEUE_PI (glibc condvar + PI-mutex, PTHREAD_MUTEX_PRIO_INHERIT):
+ *   this paragraph used to claim CAKE_FLAG_LOCK_HOLDER "is not set until
+ *   [the new owner's] next explicit futex_wait or futex_lock_pi call" —
+ *   that's inaccurate against the code below. FUTEX_WAIT_REQUEUE_PI does not
+ *   return to userspace until the calling task actually owns uaddr2 (that's
+ *   the entire reason the syscall exists: so glibc doesn't need a separate
+ *   FUTEX_LOCK_PI call after being requeued, whether the lock was granted
+ *   immediately at requeue time or the waiter had to sit on uaddr2's
+ *   internal wait list a while longer). Both the futex_wait_requeue_pi
+ *   fexit probe below (ret == 0 -> set_lock_holder()) and the
+ *   CAKE_FUTEX_WAIT_REQUEUE_PI case in the tracepoint fallback's switch
+ *   already act on exactly that return, and did before this correction —
+ *   the claim above them was simply never checked against them.
+ *
+ *   What *is* still true, and narrower than the original claim: the flag
+ *   gets set when the waiter next runs and its own syscall returns, not at
+ *   the instant the waker's FUTEX_CMP_REQUEUE_PI transfers ownership inside
+ *   the kernel — so CAKE_FLAG_LOCK_HOLDER can understate true kernel-level
+ *   ownership by up to one scheduling round-trip. Closing that would need a
+ *   hook on whichever internal, per-waiter function inside futex_requeue()
+ *   performs the transfer — not futex_requeue() itself, whose fexit would
+ *   only expose an aggregate wake count, not which task_struct got the
+ *   lock — and that function's exact name and signature isn't something
+ *   this comment is going to guess at without kernel source in hand to
+ *   verify it against, given how version-sensitive this file's fexit
+ *   target list already is (see the futex_trylock_pi SEC("?...") comment
+ *   below). Left as a known, narrow, fail-safe timing gap rather than a
+ *   guessed-at, unverifiable hook.
+ *
+ *   FIX (Medium-2 / checked-not-guessed): the per-waiter function does
+ *   exist — futex_requeue() calls rt_mutex_start_proxy_lock() once per
+ *   requeued waiter, which is where a hook targeting a specific task_struct
+ *   would have to live. Checked, not assumed. That doesn't change the
+ *   conclusion above; if anything it strengthens it. This exact code path
+ *   — the FUTEX_CMP_REQUEUE_PI proxy-lock machinery — is where a
+ *   use-after-free (current->pi_blocked_on cleared for the requeuer's
+ *   stack frame instead of the actual waiter's, on the rollback path in
+ *   remove_waiter()) reportedly went unfixed for around fifteen years
+ *   before a 2026 fix, backported unevenly across stable kernels. Whatever
+ *   confidence "the function exists and I can name it" might have
+ *   supplied is exactly offset by "this is demonstrably a part of the
+ *   kernel where subtle per-waiter-vs-requeuer confusion has lived
+ *   undetected for over a decade." A BPF hook guessing at this function's
+ *   behavior across kernel versions is the last place to add more of
+ *   that same class of confusion. Still narrow, still fail-safe, still
+ *   left alone — now for a documented reason instead of just a cautious
+ *   one.
  */
 
 #include <scx/common.bpf.h>

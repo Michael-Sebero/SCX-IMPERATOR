@@ -105,7 +105,16 @@ const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};
  *
  * Default values (0/empty) are safe: callers guard with non-zero checks
  * or the has_hybrid RODATA gate eliminates the block entirely on non-hybrid
- * CPUs where these fields are not meaningful. */
+ * CPUs where these fields are not meaningful.
+ *
+ * FIX (Weakness-6): cpu_thread_bit[]/core_thread_mask[] are currently
+ * dormant — still correctly wired from topology.rs, but with no reader.
+ * The fully-idle-core check in imperator_select_cpu() that used to consume
+ * them was simplified down to core_cpu_mask[] alone (see the comment there
+ * for why); a real implementation of the "current_occupancy &
+ * core_thread_mask" check described above would give these two arrays a
+ * purpose again, but needs a live per-CPU occupancy signal this comment
+ * isn't going to guess at — see that same comment for why. */
 const u32 cpu_core_id[CAKE_MAX_CPUS] = {};
 const u32 cpu_thread_bit[CAKE_MAX_CPUS] = {};
 const u64 core_cpu_mask[CAKE_MAX_CPUS] = {};
@@ -713,55 +722,59 @@ s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
                  * core_id is u32; guard against array bounds. */
                 u32 core_id = cpu_core_id[pcpu & (CAKE_MAX_CPUS - 1)];
                 if (core_id < CAKE_MAX_CPUS && core_cpu_mask[core_id] != 0) {
-                    /* SMT-aware fully-idle check:
-                     * core_cpu_mask[core_id] = bitmask of all logical CPUs in
-                     *   this physical core (all thread slots).
-                     * cpu_thread_bit[pcpu] = bitmask of THIS CPU's thread slot.
-                     * sibling_bits = the other thread slots in the same core.
-                     * If no sibling bits appear in big_cpu_mask (P-core set),
-                     * either the core is single-thread or siblings are busy
-                     * (not in the idle candidate set) — treat as fully-idle:
-                     * the task gets the whole P-core to itself. */
+                    /* Fully-idle-core check.
+                     *
+                     * FIX (Weakness-6): this used to OR together three
+                     * clauses. Simulated topology.rs's exact population
+                     * logic for core_cpu_mask/core_thread_mask/cpu_thread_bit
+                     * across single-thread cores, dual-SMT with both adjacent
+                     * and non-adjacent sibling numbering (AMD-style
+                     * interleaving), 4-way SMT, and 2000+ randomized layouts:
+                     * clauses 2 and 3 never differed from clause 1 alone in
+                     * any of them. That's not a coincidence, it follows from
+                     * how topology.rs populates these arrays — is_big is
+                     * computed once per physical core and applied uniformly
+                     * to every logical CPU in that core, so whenever the
+                     * whole core is a P-core, a sibling present in
+                     * core_cpu_mask[core_id] is *always* also present in
+                     * big_cpu_mask (clause 2 can never fire), and
+                     * core_thread_mask[core_id]/cpu_thread_bit[pcpu] encode
+                     * the identical "how many threads does this core have"
+                     * fact as core_cpu_mask, just via a different bit layout
+                     * (clause 3 can never disagree with clause 1). Reduced to
+                     * the one clause that actually carries information:
+                     *
+                     * sibling_bits == 0: no other logical CPU shares this
+                     * physical core with pcpu — single-thread core, or no
+                     * sibling is registered — so pcpu gets the whole
+                     * physical core to itself.
+                     *
+                     * This equivalence rests on topology.rs's per-core
+                     * uniform is_big assignment staying true (see the
+                     * core_id_usize loop in topology.rs::detect()). If that
+                     * loop is ever changed to assign is_big per-thread rather
+                     * than per-core, this comment goes stale the same way
+                     * the old "waker_tier + 1" one did — worth a second look
+                     * here if topology.rs's P/E-core detection changes.
+                     *
+                     * Separately: core_thread_mask[]/cpu_thread_bit[] are now
+                     * unused by this function. Their RODATA doc comment above
+                     * (search "current_occupancy") describes a genuinely
+                     * different, more useful check they were meant to
+                     * support — whether a sibling thread is *currently
+                     * running something*, not just whether one exists —
+                     * which the old clause 3 never actually computed despite
+                     * the name. That's a real gap between documented intent
+                     * and what shipped. Closing it needs a live per-CPU
+                     * occupancy signal (e.g. scx_bpf_cpu_rq()->nr_running),
+                     * and I don't have enough confidence in the exact struct
+                     * rq field access across kernel versions to write that
+                     * here without source in hand to check it against — same
+                     * reasoning as the FUTEX_CMP_REQUEUE_PI gap in
+                     * lock_bpf.c. Left for a follow-up, not guessed at. */
                     u64 cmask = core_cpu_mask[core_id];
-                    u8  tmask = (u8)core_thread_mask[core_id & (CAKE_MAX_CPUS - 1)];
-                    u32 my_thread_bit = cpu_thread_bit[pcpu & (CAKE_MAX_CPUS - 1)];
-                    /* Sibling slots = all core slots except this CPU's own slot */
                     u64 sibling_bits = cmask & ~(1ULL << pcpu);
-                    /* Fully-idle classification (three clauses, each sufficient):
-                     *
-                     * Clause 1: (sibling_bits == 0)
-                     *   Single-thread core (no SMT) or all siblings already
-                     *   cleared from core_cpu_mask — core is trivially alone.
-                     *
-                     * Clause 2: !(sibling_bits & big_cpu_mask)
-                     *   No sibling of this P-core appears in big_cpu_mask.
-                     *   This relies on an implicit hardware-topology invariant:
-                     *   on all current Intel hybrid (P/E-core) and ARM big.LITTLE
-                     *   designs, SMT siblings are ALWAYS the same core type —
-                     *   both threads of a P-core are P-cores, both threads of an
-                     *   E-core are E-cores.  There are no mixed-type SMT pairs.
-                     *   Therefore: if pcpu is a P-core (in big_cpu_mask) but its
-                     *   sibling is NOT in big_cpu_mask, the sibling is an E-core
-                     *   — which is impossible on real hardware.  The only way this
-                     *   clause fires in practice is if the sibling P-core is busy
-                     *   (removed from the idle candidate set we're scanning) or
-                     *   the core is non-SMT.  In both cases the candidate P-core
-                     *   effectively has the physical core to itself.
-                     *   FIX (audit/new-audit): previous code had this clause
-                     *   without explaining the hardware assumption.  If future
-                     *   hardware introduces mixed-type SMT pairs, replace this
-                     *   clause with an explicit occupancy check using
-                     *   scx_bpf_cpu_rq() → nr_running, or remove it entirely
-                     *   and rely only on clauses 1 and 3.
-                     *
-                     * Clause 3: (my_thread_bit != 0 && (tmask & ~my_thread_bit) == 0)
-                     *   core_thread_mask has only this CPU's thread bit set —
-                     *   this is a single-thread core (degenerate SMT or topology
-                     *   data shows no siblings).  Fully idle by construction. */
-                    bool full_idle = (sibling_bits == 0) ||
-                                     !(sibling_bits & big_cpu_mask) ||
-                                     (my_thread_bit != 0 &&
-                                      (tmask & ~my_thread_bit) == 0);
+                    bool full_idle = (sibling_bits == 0);
                     if (full_idle && best_full < 0)
                         best_full = (s32)pcpu;
                     else if (best_half < 0)
