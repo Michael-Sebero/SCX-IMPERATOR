@@ -2,8 +2,6 @@
 
 **Integrated · Multitiered · Preemptive · EWMA · Reprieve · Adaptive · Topology · Overrun · Runtime**
 
-*(EWMA — the asymmetric promote/demote classifier · Reprieve — the capped, renewable starvation-skip a lock holder earns · Overrun — an independent 8-bit outcome-history check that force-demotes on pattern, not just streak)*
-
 > **ABSTRACT**: `scx_imperator` is a BPF CPU scheduler built on [sched_ext](https://github.com/sched-ext/scx), designed for **gaming workloads** on modern AMD and Intel hardware. It classifies every task by observed runtime behavior and routes work through a 4-tier priority system high-priority tasks like audio callbacks and mouse input get CPU time first, bulk work like compilers gets it last.
 >
 > - **4-Tier Classification** Tasks sorted by asymmetric EWMA avg_runtime into Critical / Interactive / Frame / Bulk
