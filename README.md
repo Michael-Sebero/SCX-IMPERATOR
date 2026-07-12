@@ -9,6 +9,7 @@
 > - **Waker Tier Inheritance** High-priority task waking a lower-priority one lifts the wakee's tier, keeping producer-consumer chains tight
 > - **Lock-Holder Protection** Futex holders get scheduling priority and starvation skips to release locks faster, unblocking waiters sooner
 > - **ETD Calibration** Startup CAS ping-pong measures actual inter-core latency; cross-LLC work stealing tries the empirically-cheapest LLC first, falling back to index order before calibration completes
+> - **Hybrid P/E-Core Steering** On Intel hybrid systems, the idle-CPU dispatch path prefers an idle Performance core over an Efficiency core when one's available, re-validated against the kernel's own idle check before committing
 > - **Dispatch Latency Telemetry** Every task tracks its own scheduling latency (enqueue-to-dispatch) as a per-task EWMA; mean dispatch latency is shown live in the TUI summary bar and clipboard export, or logged periodically in headless mode via `--stats`
 > - **Preemption Burst Credit** T1/T2 tasks repeatedly interrupted before completing their quantum earn slice extensions proportional to how many times they were cut short
 > - **Desktop-First DVFS** Every tier runs at full CPU clock by default no power-saving throttle on background work since `scx_imperator` targets mains-powered desktops, not laptops or thermally-constrained systems
@@ -127,7 +128,7 @@ Tracked via fexit probes on futex acquire/release. When a task holds a contended
 The cap of 4 skips bounds the maximum extra latency any waiter can experience to roughly 4ms at default tick rates. Slice expiry (the hard ceiling) is never bypassed.
 
 > [!NOTE]
-> **Coverage gaps**: Uncontended locks never enter the kernel and are invisible to this path. `FUTEX_CMP_REQUEUE_PI` (rare, primarily glibc priority-ceiling condition variables) is also not covered the new lock owner won't get the boost until its next explicit futex acquire.
+> **Coverage gaps**: Uncontended locks never enter the kernel and are invisible to this path. `FUTEX_CMP_REQUEUE_PI` (glibc condvar + PI-mutex, `PTHREAD_MUTEX_PRIO_INHERIT`) *is* covered, not skipped — `FUTEX_WAIT_REQUEUE_PI` doesn't return to userspace until the waiter actually owns the lock, and the existing fexit probe fires on exactly that return. The real gap is narrower: the flag is set when the waiter's own syscall returns, not at the instant the kernel transfers ownership during the waker's requeue call, so it can lag true ownership by up to one scheduling round-trip. Closing that fully would mean hooking an internal, per-waiter kernel function with a documented history of subtle correctness bugs in this exact code path — left as a known, narrow, fail-safe timing gap rather than a guessed-at hook into unstable internals.
 
 ### Dispatch Latency Telemetry
 
@@ -191,14 +192,14 @@ Every tier on every profile runs at `SCX_CPUPERF_ONE` (100% of hardware-permitte
 select_cpu
   ├── IRQ context?      → stamp CAKE_FLOW_IRQ_WAKE on tctx
   ├── SCX_WAKE_SYNC?    → direct dispatch to waker's CPU (dispatch_sync_cold)
-  ├── Idle CPU found?   → direct dispatch via SCX_DSQ_LOCAL_ON
+  ├── Idle CPU found?   → hybrid: prefer an idle P-core over the default E-core pick, re-validated before use; direct dispatch via SCX_DSQ_LOCAL_ON
   └── All busy          → tunnel (LLC, timestamp) to enqueue, return prev_cpu
 
 enqueue
   ├── stamp enqueue_time for dispatch latency measurement
   ├── sleep_entry_time set?  → pull avg_runtime toward tier midpoint if slept >500ms (post-sleep recovery)
   ├── SCX_ENQ_PREEMPT + T1/T2? → accumulate burst_credit (up to per-tier cap)
-  ├── burst_credit > 0? → extend slice by credit amount, zero credit
+  ├── burst_credit > 0? → extend slice and write it into next_slice (not just the local dispatch slice), zero credit
   ├── IRQ_WAKE flag     → tier = T0 (one-shot, consumed here)
   ├── Waker mailbox     → promote wakee tier if waker is higher priority
   ├── Lock-holder flag  → advance virtual timestamp within tier
@@ -214,7 +215,9 @@ running   → stamp last_run_at, update jitter_ewma_us from enqueue_time, consum
             publish tier to per-CPU mailbox, set tier bitmask
 tick      → slice expiry check, starvation check, lock-holder skip, DVFS update
 stopping  → clear tier bitmask (before reclassify), run EWMA + DRR++
-reclassify→ if tier changed: recompute next_slice, zero burst_credit
+reclassify→ recompute next_slice every bout, not just on tier change (this is what
+            makes the burst-credit extension above actually take effect — see §4);
+            if tier changed: reset reclass_counter, zero burst_credit
 ```
 
 ### Key Data Structures
@@ -240,7 +243,8 @@ reclassify→ if tier changed: recompute next_slice, zero burst_credit
 | 28–31 | `enqueue_time` | Wall-clock ns at queue entry; consumed after one use |
 | 32–33 | `jitter_ewma_us` | Per-task dispatch latency EWMA in ~µs |
 | 34–35 | `burst_credit` | Accumulated preemption-recovery credit in kns units |
-| 36–63 | `__pad` | Reserved |
+| 36–39 | `sleep_entry_time` | Wall-clock ns at last blocking-sleep entry; consumed by post-sleep recovery in `enqueue` |
+| 40–63 | `__pad` | Reserved |
 
 ---
 
@@ -248,7 +252,9 @@ reclassify→ if tier changed: recompute next_slice, zero burst_credit
 
 ### ETD Calibration
 
-On startup, two threads are pinned to each CPU pair and exchange a flag with atomic CAS to measure actual inter-core latency. This runs in the background and takes a few seconds. Until it completes, cross-LLC stealing falls back to index order.
+On startup, calibration measures actual inter-core latency by pinning two threads to a CPU pair and exchanging a flag with atomic CAS, timed under real-time priority (`SCHED_FIFO` 99) for measurement accuracy. This runs in the background.
+
+By default this doesn't measure every CPU pair. `select_etd_pairs()` samples ~3 evenly-spread CPU pairs per LLC pair — enough for the cross-LLC cost table's per-LLC-pair `min()` reduction, since inter-core latency is dominated by which two physical domains a pair spans, not which specific cores within them. On single-LLC systems (single CCD/CCX — most current desktop parts) calibration is skipped entirely: nothing downstream ever reads a same-LLC latency value, so there's nothing worth measuring. This scoping exists specifically because two CPUs held under real-time priority is a real, if narrow, risk of colliding with an already-running game — the smaller and rarer that window, the better. `--full-etd-sweep` opts back into measuring every `C(nr_cpus, 2)` pair — full accuracy, full exposure — and logs an explicit warning stating the pair-count multiplier when used.
 
 | Parameter | Value |
 | :--- | :--- |
@@ -257,7 +263,7 @@ On startup, two threads are pinned to each CPU pair and exchange a flag with ato
 | Warmup iterations | 200 |
 | Max acceptable σ | 15 ns (3 retries) |
 
-The **median** of samples is used (not the mean) to filter IRQ jitter. If affinity pinning fails for a pair, that entry is filled with a 500 ns sentinel so it is never treated as a free path.
+The **median** of samples is used (not the mean) to filter IRQ jitter. If affinity pinning fails for a pair, that entry is filled with a 500 ns sentinel so it is never treated as a free path. Until calibration completes (or on any system where it's skipped outright), cross-LLC stealing falls back to index order.
 
 ### Dispatch Order
 
@@ -268,6 +274,10 @@ Each LLC has its own dispatch queue. On a task dispatch:
 3. Fall through remaining LLCs in order
 
 On single-LLC systems the steal path is eliminated entirely at JIT load time.
+
+### Hybrid P/E-Core Steering
+
+On systems with Performance/Efficiency core asymmetry, the idle-CPU path in `select_cpu` doesn't stop at whatever core the kernel's default idle search returns. If that pick is an E-core, a bounded scan of the system's P-cores looks for one that's fully idle (no live SMT sibling), falling back to a half-idle candidate if none is found. Any candidate found this way is re-validated through a second, real idle-CPU check before being used — the scan only ever produces a *hint* toward a better placement, never a substitute for the kernel's own atomic idle-claiming, so an incorrect guess just falls back to the original pick rather than causing a bad dispatch. No effect on non-hybrid systems: the RODATA flag gating this path is only set when hybrid cores are actually detected at topology-detection time.
 
 ### Preemption Kick
 
