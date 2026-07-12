@@ -1,6 +1,6 @@
 ## **I.M.P.E.R.A.T.O.R**
 
-**Integrated · Multitiered · Priority · Execution · Ranked · Adaptive · Topology · Ordered · Runtime**
+**Integrated · Multitiered · Preemptive · Execution · Ranked · Adaptive · Topology · Ordered · Runtime**
 
 > **ABSTRACT**: `scx_imperator` is a BPF CPU scheduler built on [sched_ext](https://github.com/sched-ext/scx), designed for **gaming workloads** on modern AMD and Intel hardware. It classifies every task by observed runtime behavior and routes work through a 4-tier priority system high-priority tasks like audio callbacks and mouse input get CPU time first, bulk work like compilers gets it last.
 >
@@ -59,7 +59,9 @@ Traditional schedulers (CFS, EEVDF) optimize for **fairness** if a game and a co
 1. **Latency inversion**: A 50µs input handler waits behind a 50ms compile job
 2. **Frame jitter**: Game render threads get preempted mid-frame by background work
 
-**scx_imperator's answer**: Classify tasks by *behavior* (how long they actually run), not by type or nice value. Short-burst tasks (input, audio) get instant priority. Long-running tasks (compilers) get larger time slices but lower priority. The system self-tunes no manual tagging or cgroup setup required.
+**scx_imperator's answer**: reject negotiated fairness in favor of imposed, structural rank. Tasks are classified by *behavior* (how long they actually run), not by type or nice value, and once a task is ranked, its tier simply wins — no per-dispatch negotiation; see §3 for exactly how that ordering is enforced. Short-burst tasks (input, audio) get instant priority. Long-running tasks (compilers) get larger time slices but lower priority. The system self-tunes no manual tagging or cgroup setup required.
+
+**How that rank gets exercised**: enforcement is unconditional once a task is ranked — preemption kicks, starvation ceilings, and DVFS targets all key off tier alone. But the machinery that *computes* placement leans the other way on purpose: idle-CPU selection is delegated to the kernel's own atomic idle-claiming rather than reimplemented in BPF (§6); hybrid P-core placement (§7) is offered only as a hint and re-validated against a real idle check before it's used; a T2/T3 preemption kick that looked correct in theory was removed after A/B testing showed a measurable frame-rate regression. The rank is absolute. Getting there isn't guesswork.
 
 ---
 
