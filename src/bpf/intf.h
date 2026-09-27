@@ -252,9 +252,15 @@ struct imperator_task_ctx {
      *
      * Struct layout [Bytes 36-63]:
      *   [36-39]  sleep_entry_time  (u32)     ← Gap-1 fix
-     *   [40-63]  __pad             (u8[24])  reduced from [28] */
+     *   [40-41]  burst_acc_us      (u16)     ← audit/G5-2
+     *   [42-63]  __pad             (u8[22]) */
     u32 sleep_entry_time;  /* bytes 36-39: sleep-entry timestamp for recovery heuristic */
-    u8  __pad[24];         /* bytes 40-63: reserved, reduced from [28] */
+
+    /* audit/G5-2: CPU time (~µs, saturating at 65535) accumulated across
+     * preempted bouts since the task last slept. Written by
+     * reclassify_task_cold(); zeroed when the task blocks. */
+    u16 burst_acc_us;      /* bytes 40-41 */
+    u8  __pad[22];         /* bytes 42-63: reserved */
 } __attribute__((aligned(64)));
 
 _Static_assert(sizeof(struct imperator_task_ctx) == 64,

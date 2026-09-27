@@ -209,10 +209,10 @@ static __always_inline void llc_mark_nonempty(u32 llc_id)
  * forced false-sharing through the iterator's alignment requirements. */
 struct imperator_scratch {
     bool dummy_idle;            /* 1B: idle flag from scx_bpf_select_cpu_dfl */
-    u8   _pad0[3];              /* Align cached_llc to u32 boundary */
-    u32  cached_llc;            /* 4B: LLC ID tunneled from select_cpu → enqueue (saves 1 kfunc) */
-    u64  cached_now;            /* 8B: scx_bpf_now() tunneled from select_cpu → enqueue (saves 1 kfunc) */
-    u8   _pad[112];             /* Pad to 128B (2 cache lines): 1+3+4+8+112 = 128 */
+    /* cached_llc/cached_now removed (audit/G5-1): ops.enqueue() also runs
+     * without a preceding ops.select_cpu() on the same CPU, so the tunneled
+     * values were stale on those paths. imperator_enqueue derives both. */
+    u8   _pad[127];
 } global_scratch[CAKE_MAX_CPUS] SEC(".bss") __attribute__((aligned(128)));
 _Static_assert(sizeof(struct imperator_scratch) == 128,
     "imperator_scratch must be exactly 128B (2 cache lines) -- update _pad if fields change");
@@ -293,6 +293,36 @@ const fused_config_t tier_configs[8] = {
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T3,
                 CAKE_DEFAULT_STARVATION_T3 >> 10),
 };
+
+/* audit/G5-3: LLC DSQ ordering is earliest-deadline-first with
+ * deadline = enqueue time + the tier's starvation budget from tier_configs.
+ *
+ * The previous (tier << 56) | timestamp key was strict priority with no
+ * aging: a queued T3 task waited behind every later T0-T2 arrival, and the
+ * tick-side starvation check could not help it (it only inspects the running
+ * task, and slice < threshold in every profile made it unreachable). Under
+ * sustained T0-T2 saturation that ends in the sched_ext watchdog's
+ * runnable-task-stall exit.
+ *
+ * Budgets increase with tier in every profile (and --starvation scales them
+ * uniformly), so same-time arrivals keep strict tier order. A waiting task
+ * overtakes newer higher-tier arrivals only after it has waited the budget
+ * gap (Default: T1 6.5ms, T2 12ms, T3 80ms behind the next tier up). */
+static __always_inline u64 tier_deadline(u64 now, u8 tier, u64 advance)
+{
+    u8 t = CAKE_TIER_IDX(tier);
+    u64 budget = UNPACK_STARVATION_NS(tier_configs[t]);
+
+    if (advance && t > CAKE_TIER_CRITICAL) {
+        u64 above = UNPACK_STARVATION_NS(tier_configs[CAKE_TIER_IDX(t - 1)]);
+        u64 gap = budget > above ? budget - above - 1 : 0;
+        if (advance > gap)
+            advance = gap;
+    }
+
+    u64 dl = now + budget;
+    return dl > advance ? dl - advance : 0;
+}
 
 /* Per-tier graduated backoff recheck masks (RODATA)
  * Lower tiers (more stable) recheck less often.
@@ -386,6 +416,7 @@ struct imperator_task_ctx *alloc_task_ctx_cold(struct task_struct *p)
      * BPF task-storage zero-initialises on create, so this is redundant but
      * explicit — consistent with enqueue_time and burst_credit above. */
     ctx->sleep_entry_time = 0;
+    ctx->burst_acc_us = 0;
 
     /* FIX (C-2): Initialise pending_futex_op to CAKE_FUTEX_OP_UNSET (0xFF).
      *
@@ -558,50 +589,6 @@ consume_irq_wake_get_tier_slice(struct imperator_task_ctx *tctx, u64 *slice_out)
     return CAKE_TIER_INTERACT;
 }
 
-/* SYNC fast-path dispatch: waker's CPU is by definition running.
- * Noinline: only 3 args (p, wake_flags, hint_tctx) — r1→r6, r2→r7, r3→r8.
- * hint_tctx is the pointer already obtained by the IRQ-detection block at
- * the top of imperator_select_cpu; passing it here eliminates a second
- * bpf_task_storage_get (~20c) on the SYNC path (the dominant gaming wakeup).
- * hint_tctx may be NULL for unclassified tasks — consume_irq_wake_get_tier_slice
- * handles that case with safe defaults.
- *
- * CPUMASK GUARD: Check inside cold path (Rule 5/13: no extra work on
- * inline hot path). Wine/Proton threadpools use sched_setaffinity —
- * waker's CPU may not be in woken task's cpumask. Returns -1 to signal
- * fallthrough to kernel path which handles cpumask correctly. */
-static __attribute__((noinline))
-s32 dispatch_sync_cold(struct task_struct *p, u64 wake_flags,
-                       struct imperator_task_ctx *hint_tctx)
-{
-    u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
-    if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-        return -1;
-
-    /* Use the tctx pointer already in hand — no second storage lookup needed. */
-    struct imperator_task_ctx *tctx = hint_tctx;
-
-    /* Determine effective tier and slice via shared helper.
-     * consume_irq_wake_get_tier_slice() handles the CAKE_FLOW_IRQ_WAKE one-shot
-     * flag, T0 slice computation, stats accounting, and NULL-tctx fallback. */
-    u64 slice;
-    u8 tier = consume_irq_wake_get_tier_slice(tctx, &slice);
-
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, wake_flags);
-
-    /* FIX (#11): Count direct-dispatch stats so TUI reflects the common idle-path case. */
-    if (enable_stats) {
-        struct imperator_stats *s = get_local_stats();
-        if (s) {
-            s->nr_new_flow_dispatches++;
-            if (tier < CAKE_TIER_MAX)
-                s->nr_tier_dispatches[tier]++;
-        }
-    }
-
-    return (s32)cpu;
-}
-
 s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags)
 {
@@ -629,25 +616,18 @@ s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
             irq_context = true;
     }
 
-    /* Fetch tctx only when a downstream path will consume it */
     struct imperator_task_ctx *irq_tctx =
-        (irq_context || (wake_flags & SCX_WAKE_SYNC)) ?
-        bpf_task_storage_get(&task_ctx, p, 0, 0) : NULL;
+        irq_context ? bpf_task_storage_get(&task_ctx, p, 0, 0) : NULL;
 
     if (unlikely(irq_context) && irq_tctx)
         __sync_fetch_and_or(&irq_tctx->packed_info,
                             (u32)CAKE_FLOW_IRQ_WAKE << SHIFT_FLAGS);
 
-    /* SYNC FAST PATH: Direct dispatch to waker's CPU.
-     * Pass irq_tctx already obtained above — dispatch_sync_cold reuses it
-     * directly, saving one bpf_task_storage_get (~20c) on this hot path.
-     * Cold helper checks cpumask internally (Rule 5: zero extra hot-path
-     * instructions). Returns -1 if cpumask disallows → fall through. */
-    if (wake_flags & SCX_WAKE_SYNC) {
-        s32 sync_cpu = dispatch_sync_cold(p, wake_flags, irq_tctx);
-        if (sync_cpu >= 0)
-            return sync_cpu;
-    }
+    /* audit/G5-5: SCX_WAKE_SYNC is left to scx_bpf_select_cpu_dfl(). It
+     * prefers an idle cache-affine prev_cpu, and only co-locates the wakee
+     * with the waker when the waker's local DSQ is empty and idle CPUs
+     * exist. The removed fast path stacked every SYNC wakee on the busy
+     * waker's local DSQ unconditionally, ahead of LLC-DSQ tier ordering. */
 
     u32 tc_id = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
     struct imperator_scratch *scr = &global_scratch[tc_id];
@@ -804,7 +784,10 @@ s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
             }
         }
 
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, wake_flags);
+        /* audit/G5-5: wake_flags are SCX_WAKE_* bits, not SCX_ENQ_* bits.
+         * On 6.12-6.18 WF_SYNC (0x10) equals ENQUEUE_HEAD (0x10), so SYNC
+         * wakees were inserted at the head of the local DSQ. */
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice, 0);
 
         /* FIX (#11): Count idle-path direct dispatches for accurate TUI stats. */
         if (enable_stats) {
@@ -819,17 +802,9 @@ s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
         return cpu;
     }
 
-    /* ALL BUSY: tunnel LLC ID + timestamp for enqueue (~22ns saved on
-     * the 90% idle path above where these were previously wasted).
-     * select_cpu runs on same CPU as enqueue — safe to tunnel.
-     *
-     * FIX (audit): Use the *task's* target LLC (derived from cpu, which is
-     * prev_cpu when all CPUs are busy) rather than the *waker's* LLC (tc_id).
-     * On a dual-CCD system nearly all "all-busy" enqueues previously landed
-     * in the waker's LLC DSQ but were dispatched from prev_cpu's LLC, forcing
-     * 100% of those tasks through the slower cross-LLC steal path. */
-    scr->cached_llc = cpu_llc_id[(u32)cpu & (CAKE_MAX_CPUS - 1)];
-    scr->cached_now = scx_bpf_now();
+    /* ALL BUSY: imperator_enqueue places the task in the LLC DSQ of
+     * task_cpu(p) (== prev_cpu here), preserving the earlier audit fix that
+     * keyed placement on the task's LLC rather than the waker's. */
     return prev_cpu;
 }
 
@@ -839,19 +814,21 @@ s32 BPF_STRUCT_OPS(imperator_select_cpu, struct task_struct *p, s32 prev_cpu,
  * cache pollution and GPU pipeline bubbles. T0/T1 kicks are retained via the
  * O(1) bitmask path below; tick-based starvation detection covers the rest. */
 
-/* Enqueue - A+B architecture: per-LLC DSQ with vtime = (tier << 56) | timestamp */
+/* Enqueue - A+B architecture: per-LLC DSQ ordered by tier deadline (tier_deadline()) */
 void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
 {
     register struct task_struct *p_reg asm("r6") = p;
     u32 task_flags = p_reg->flags;
 
-    /* KFUNC TUNNELING: Reuse LLC ID + timestamp cached by select_cpu in scratch.
-     * Eliminates 2 kfunc trampolines (~40-60ns) — select_cpu always runs on
-     * the same CPU immediately before enqueue, so values are fresh. */
+    /* audit/G5-1: ops.enqueue() is reached without a same-CPU ops.select_cpu()
+     * on slice expiry, kicks, sched_yield, property changes, and wakeups of
+     * tasks with nr_cpus_allowed == 1 (and, before 6.15, cross-LLC wakeups
+     * delivered through the ttwu wakelist). The scratch-tunneled values were
+     * stale on all of those paths: wrong-LLC placement and ancient vtimes. */
     u32 enq_cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
-    struct imperator_scratch *scr = &global_scratch[enq_cpu];
-    u64 now_cached = scr->cached_now;
-    u32 enq_llc = scr->cached_llc;
+    u64 now_cached = scx_bpf_now();
+    u32 enq_llc = cpu_llc_id[(u32)scx_bpf_task_cpu(p_reg) & (CAKE_MAX_CPUS - 1)] &
+                  (CAKE_MAX_LLCS - 1);
 
     struct imperator_task_ctx *tctx = get_task_ctx(p_reg, false);
 
@@ -862,7 +839,7 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
      * assigned to nice=0 kthreads by alloc_task_ctx_cold(). They will reclassify
      * to their correct tier within a few stops once a tctx is allocated. */
     if (unlikely((task_flags & PF_KTHREAD) && !tctx)) {
-        u64 vtime = ((u64)CAKE_TIER_INTERACT << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
+        u64 vtime = tier_deadline(now_cached, CAKE_TIER_INTERACT, 0);
         scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, quantum_ns, vtime, enq_flags);
         llc_mark_nonempty(enq_llc);
         return;
@@ -877,7 +854,7 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
      * Tasks with no context yet fall back to T3 (yield implies they're not urgent). */
     if (!(enq_flags & (SCX_ENQ_WAKEUP | SCX_ENQ_PREEMPT))) {
         u8 yield_tier = tctx_reg ? CAKE_TIER_IDX(GET_TIER(tctx_reg)) : CAKE_TIER_BULK;
-        u64 vtime = ((u64)yield_tier << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
+        u64 vtime = tier_deadline(now_cached, yield_tier, 0);
         scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, quantum_ns, vtime, enq_flags);
         llc_mark_nonempty(enq_llc);
         return;
@@ -885,7 +862,7 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
 
     if (unlikely(!tctx_reg)) {
         /* No context yet - use Frame tier */
-        u64 vtime = ((u64)CAKE_TIER_FRAME << 56) | (now_cached & 0x00FFFFFFFFFFFFFFULL);
+        u64 vtime = tier_deadline(now_cached, CAKE_TIER_FRAME, 0);
         scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, quantum_ns, vtime, enq_flags);
         llc_mark_nonempty(enq_llc);
         return;
@@ -894,10 +871,8 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
     /* C2-Infra: Stamp enqueue_time for dispatch latency measurement.
      *
      * Written here — after all early-exit paths (kthread no-tctx, yield) and
-     * after confirming tctx_reg is non-NULL.  Uses now_cached (tunneled from
-     * select_cpu via global_scratch) rather than a fresh scx_bpf_now() call,
-     * which saves one kfunc trampoline (~10-15ns) at the cost of at most one
-     * CPU tick of timestamp error — negligible at the granularity of µs EWMA.
+     * after confirming tctx_reg is non-NULL.  Uses now_cached, read with
+     * scx_bpf_now() at the top of this function.
      *
      * Truncated to u32: matches last_run_at (also u32 truncation of scx_bpf_now()).
      * The subtraction (last_run_at - enqueue_time) in imperator_running is always
@@ -1297,18 +1272,14 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
         }
     }
 
-    /* A+B: Vtime-encoded priority: (tier << 56) | timestamp
+    /* A+B: vtime = tier deadline (see tier_deadline(), audit/G5-3)
      *
      * DRR++ NEW FLOW BONUS: Tasks with CAKE_FLOW_NEW get a vtime reduction,
      * making them drain before established same-tier tasks. This gives
      * newly spawned threads instant responsiveness (e.g., game launching a
      * new worker). Cleared by reclassify_task_cold when deficit exhausts.
      *
-     * FIX (#2): Guard vtime subtraction to prevent underflow into the tier
-     * bits at [63:56]. If now_cached is small (early boot or timer wrap) and
-     * new_flow_bonus_ns is large (8ms), the raw subtraction wraps the u64
-     * into the tier field, silently misclassifying the task. Use saturating
-     * arithmetic on the timestamp portion only.
+     * FIX (#2): the subtraction saturates at 0 inside tier_deadline().
      *
      * ── FEATURE 3: LOCK HOLDER VTIME ADVANCE (adapted from LAVD) ──────────
      * If this task currently holds a futex (set by lock_bpf.c fexit probes),
@@ -1326,18 +1297,16 @@ void BPF_STRUCT_OPS(imperator_enqueue, struct task_struct *p, u64 enq_flags)
      * the largest advance already in the system (DRR++ new-flow bonus), so
      * using the same value keeps the relative ordering consistent and avoids
      * introducing a new tuning parameter. */
-    u64 ts = now_cached & 0x00FFFFFFFFFFFFFFULL;
+    /* audit/G5-3: both advances compound as before; tier_deadline() caps the
+     * sum below the gap to the next-higher tier's budget, so an advance still
+     * only reorders a task against its own tier for same-time arrivals. */
+    u64 advance = 0;
     if (task_packed & ((u32)CAKE_FLOW_NEW << SHIFT_FLAGS))
-        ts = (ts > new_flow_bonus_ns) ? (ts - new_flow_bonus_ns) : 0;
-
-    /* Lock-holder advance: sort ahead of same-tier non-holders. Applied after
-     * new-flow bonus so both effects compound (a new flow that also holds a
-     * lock sorts to the very front of its tier). Saturating to preserve tier
-     * bits — same FIX (#2) guard. */
+        advance += new_flow_bonus_ns;
     if (unlikely(task_packed & ((u32)CAKE_FLAG_LOCK_HOLDER << SHIFT_FLAGS)))
-        ts = (ts > new_flow_bonus_ns) ? (ts - new_flow_bonus_ns) : 0;
+        advance += new_flow_bonus_ns;
 
-    u64 vtime = ((u64)tier << 56) | ts;
+    u64 vtime = tier_deadline(now_cached, tier, advance);
 
     scx_bpf_dsq_insert_vtime(p_reg, LLC_DSQ_BASE + enq_llc, slice, vtime, enq_flags);
     /* Mark LLC as non-empty so dispatch can find work */
@@ -1410,8 +1379,11 @@ void BPF_STRUCT_OPS(imperator_dispatch, s32 raw_cpu, struct task_struct *prev)
     if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + my_llc, 0))
         return;
 
-    /* Drain confirmed empty — clear our entry so other CPUs don't steal here */
-    imperator_relaxed_store_u8(&llc_nonempty[my_llc & (CAKE_MAX_LLCS - 1)].nonempty, 0);
+    /* audit/G5-6: move_to_local() also fails when every queued task is affine
+     * to other CPUs; clearing the flag then hides those tasks from the steal
+     * scan. Clear it only when the DSQ is really empty. */
+    if (!scx_bpf_dsq_nr_queued(LLC_DSQ_BASE + my_llc))
+        imperator_relaxed_store_u8(&llc_nonempty[my_llc & (CAKE_MAX_LLCS - 1)].nonempty, 0);
 
     /* RODATA gate: single-LLC systems skip steal entirely (Rule 5).
      * JIT DCEs the loop below when nr_llcs == 1. */
@@ -1443,33 +1415,13 @@ void BPF_STRUCT_OPS(imperator_dispatch, s32 raw_cpu, struct task_struct *prev)
     for (u32 i = 0; i < nr_llcs; i++) {
         if (i != my_llc &&
             imperator_relaxed_load_u8(&llc_nonempty[i].nonempty)) {
-            /* CCD-fill threshold check (threads_per_ccd RODATA):
-             *
-             * Stealing from an LLC that has fewer tasks than it has CPU threads
-             * is premature — the CCD has spare capacity and its tasks should
-             * run locally, not migrate cross-LLC.  Premature stealing:
-             *   1. Causes unnecessary cross-LLC cache-miss penalties (ETD cost).
-             *   2. Fragments working sets that benefit from sharing the LLC.
-             *   3. Moves work away from CPUs that are about to become idle.
-             *
-             * threads_per_ccd is the thread count of the largest CCD.  When
-             * the DSQ for LLC `i` has fewer queued tasks than threads_per_ccd,
-             * at least one thread in that CCD is idle or about to dispatch
-             * locally — cross-LLC stealing is wasteful.
-             *
-             * threads_per_ccd = 0 (default/pre-loader): threshold check is
-             * skipped (0 < 0 is always false) — falls back to legacy steal
-             * behaviour unchanged.
-             *
-             * Implementation: scx_bpf_dsq_nr_queued(DSQ_id) returns the
-             * current depth of the specified DSQ. */
-            if (threads_per_ccd > 0) {
-                u32 victim_dsq = LLC_DSQ_BASE + i;
-                u32 depth = scx_bpf_dsq_nr_queued(victim_dsq);
-                if (depth < threads_per_ccd)
-                    continue;  /* CCD not saturated — skip */
-            }
-
+            /* audit/G5-6: threads_per_ccd depth gate removed. It compared the
+             * number of *waiting* tasks against the CCD's thread count, so a
+             * CPU going idle here refused to steal until 16 tasks (9950X)
+             * were already queued on the other LLC, leaving queued work
+             * behind idle CPUs for up to a full slice. ops.dispatch() only
+             * reaches this point when the local LLC DSQ has nothing this CPU
+             * can run. */
             steal_mask |= 1u << i;
             u8 c = llc_etd_cost[my_llc & (CAKE_MAX_LLCS - 1)][i & (CAKE_MAX_LLCS - 1)];
             /* Only update cheapest when ETD data is present (c > 0). */
@@ -1485,7 +1437,8 @@ void BPF_STRUCT_OPS(imperator_dispatch, s32 raw_cpu, struct task_struct *prev)
         steal_mask &= ~(1u << cheapest_llc);
         if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + cheapest_llc, 0))
             return;
-        imperator_relaxed_store_u8(&llc_nonempty[cheapest_llc & (CAKE_MAX_LLCS - 1)].nonempty, 0);
+        if (!scx_bpf_dsq_nr_queued(LLC_DSQ_BASE + cheapest_llc))
+            imperator_relaxed_store_u8(&llc_nonempty[cheapest_llc & (CAKE_MAX_LLCS - 1)].nonempty, 0);
     }
 
     /* Try remaining LLCs in BSF order (original behaviour) */
@@ -1497,8 +1450,8 @@ void BPF_STRUCT_OPS(imperator_dispatch, s32 raw_cpu, struct task_struct *prev)
         steal_mask &= steal_mask - 1;  /* clear LSB */
         if (scx_bpf_dsq_move_to_local(LLC_DSQ_BASE + victim, 0))
             return;
-        /* Victim was empty despite flag being set — clear stale entry */
-        imperator_relaxed_store_u8(&llc_nonempty[victim & (CAKE_MAX_LLCS - 1)].nonempty, 0);
+        if (!scx_bpf_dsq_nr_queued(LLC_DSQ_BASE + victim))
+            imperator_relaxed_store_u8(&llc_nonempty[victim & (CAKE_MAX_LLCS - 1)].nonempty, 0);
     }
 }
 
@@ -1603,13 +1556,24 @@ void BPF_STRUCT_OPS(imperator_tick, struct task_struct *p)
      * inherit the kicked task's stale tier from the mailbox rather than the
      * new task's tier.  The starvation path was already fixed; this makes the
      * two kick paths consistent. */
+    /* audit/G5-4: kick only when something can take the CPU. With nothing
+     * queued the kernel keeps this task running and refills its slice with
+     * SCX_SLICE_DFL without calling ops.stopping()/ops.running(), so
+     * last_run_at stays put and the unconditional kick fired on every tick:
+     * an irq_work self-IPI plus a pass through __schedule() and
+     * ops.dispatch() that resumed the same task. A later arrival is still
+     * caught within 1 tick. */
     if (unlikely(runtime > tctx_reg->next_slice)) {
-        struct mega_mailbox_entry *exp_mbox = &mega_mailbox[cpu_id_reg];
-        u8 exp_flags = (u8)(MBOX_VALID_FLAG | (tier_reg & MBOX_TIER_MASK));
-        if (imperator_relaxed_load_u8(&exp_mbox->flags) != exp_flags)
-            imperator_relaxed_store_u8(&exp_mbox->flags, exp_flags);
-        scx_bpf_kick_cpu(cpu_id_reg, SCX_KICK_PREEMPT);
-        return;
+        u32 tick_llc = cpu_llc_id[cpu_id_reg] & (CAKE_MAX_LLCS - 1);
+        if (scx_bpf_dsq_nr_queued(LLC_DSQ_BASE + tick_llc) > 0 ||
+            scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL) > 0) {
+            struct mega_mailbox_entry *exp_mbox = &mega_mailbox[cpu_id_reg];
+            u8 exp_flags = (u8)(MBOX_VALID_FLAG | (tier_reg & MBOX_TIER_MASK));
+            if (imperator_relaxed_load_u8(&exp_mbox->flags) != exp_flags)
+                imperator_relaxed_store_u8(&exp_mbox->flags, exp_flags);
+            scx_bpf_kick_cpu(cpu_id_reg, SCX_KICK_PREEMPT);
+            return;
+        }
     }
 
     /* PHASE 2: STARVATION CHECK — graduated confidence backoff.
@@ -1980,7 +1944,7 @@ static const u16 tier_overrun_gate[4] = {
  * at the same tier.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static __attribute__((noinline))
-void reclassify_task_cold(struct imperator_task_ctx *tctx)
+void reclassify_task_cold(struct imperator_task_ctx *tctx, bool runnable)
 {
     u32 packed = imperator_relaxed_load_u32(&tctx->packed_info);
 
@@ -2015,7 +1979,19 @@ void reclassify_task_cold(struct imperator_task_ctx *tctx)
     u32 runtime_us = runtime_raw >> 10;  /* ns → ~μs (÷1024 ≈ ÷1000) */
 
     /* Clamp to u16 max for EWMA field (65ms max, more than any reasonable burst) */
-    u16 rt_clamped = runtime_us > 0xFFFF ? 0xFFFF : (u16)runtime_us;
+    u16 bout_us = runtime_us > 0xFFFF ? 0xFFFF : (u16)runtime_us;
+
+    /* audit/G5-2: classify on the burst since the task last slept, not on
+     * this bout. A preempted bout ends at the scheduler's own slice boundary
+     * (flat quantum_ns on the re-enqueue path, rounded up to the tick), so
+     * per-bout samples pulled every CPU-bound task to ~2-4ms: T3 hogs were
+     * promoted to T2 after one contended bout and T1-seeded hogs never left
+     * T1/T2. An unfinished burst is a lower bound, so on a preemption it may
+     * only raise avg_runtime (LAVD: max(avg_runtime, acc_runtime) in
+     * calc_sum_runtime_factor()). DRR++ deficit still consumes per bout. */
+    u32 burst_us = (u32)tctx->burst_acc_us + bout_us;
+    u16 rt_clamped = burst_us > 0xFFFF ? 0xFFFF : (u16)burst_us;
+    tctx->burst_acc_us = runnable ? rt_clamped : 0;
 
     /* ── GRADUATED BACKOFF ──
      * When tier has been stable for 3+ consecutive stops, throttle reclassify
@@ -2050,11 +2026,12 @@ void reclassify_task_cold(struct imperator_task_ctx *tctx)
              * restores T0/T1 priority within ~4 bouts instead of ~16. */
             u16 new_avg;
             if (rt_clamped < avg_rt)
-                new_avg = avg_rt - (avg_rt >> 2) + (rt_clamped >> 2);  /* promote α=1/4 */
+                new_avg = runnable ? avg_rt
+                                   : avg_rt - (avg_rt >> 2) + (rt_clamped >> 2);  /* promote α=1/4 */
             else
                 new_avg = avg_rt - (avg_rt >> 4) + (rt_clamped >> 4);  /* demote  α=1/16 */
             u16 deficit = EXTRACT_DEFICIT(old_fused);
-            deficit = (rt_clamped >= deficit) ? 0 : deficit - rt_clamped;
+            deficit = (bout_us >= deficit) ? 0 : deficit - bout_us;
 
             u32 new_fused = PACK_DEFICIT_AVG(deficit, new_avg);
             if (new_fused != old_fused)
@@ -2098,7 +2075,8 @@ void reclassify_task_cold(struct imperator_task_ctx *tctx)
     u16 avg_rt = EXTRACT_AVG_RT(old_fused);
     u16 new_avg;
     if (rt_clamped < avg_rt)
-        new_avg = avg_rt - (avg_rt >> 2) + (rt_clamped >> 2);  /* promote α=1/4 */
+        new_avg = runnable ? avg_rt
+                           : avg_rt - (avg_rt >> 2) + (rt_clamped >> 2);  /* promote α=1/4 */
     else
         new_avg = avg_rt - (avg_rt >> 4) + (rt_clamped >> 4);  /* demote  α=1/16 */
 
@@ -2107,7 +2085,7 @@ void reclassify_task_cold(struct imperator_task_ctx *tctx)
      * new-flow flag → task loses its priority bonus within the tier.
      * Initial deficit = quantum + new_flow_bonus ≈ 10ms of credit. */
     u16 deficit = EXTRACT_DEFICIT(old_fused);
-    deficit = (rt_clamped >= deficit) ? 0 : deficit - rt_clamped;
+    deficit = (bout_us >= deficit) ? 0 : deficit - bout_us;
 
     /* Pre-compute deficit_exhausted before rt_clamped/deficit die (Rule 36) */
     bool deficit_exhausted = (deficit == 0 && (packed & ((u32)CAKE_FLOW_NEW << SHIFT_FLAGS)));
@@ -2496,7 +2474,7 @@ void BPF_STRUCT_OPS(imperator_stopping, struct task_struct *p, bool runnable)
         else
             tctx->sleep_entry_time = 0;
 
-        reclassify_task_cold(tctx);
+        reclassify_task_cold(tctx, runnable);
     }
 }
 

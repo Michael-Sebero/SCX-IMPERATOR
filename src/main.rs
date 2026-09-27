@@ -57,8 +57,9 @@ pub enum Profile {
     ///
     /// Changes vs the Default profile:
     ///   - Larger quantum (4ms) reduces context-switch overhead on sustained T2/T3
-    ///   - Looser starvation thresholds: T3 gets 200ms before forced preemption
-    ///     (matches Legacy) since nothing latency-critical is competing for the core
+    ///   - Looser starvation budgets: T3's deadline budget is 200ms (matches
+    ///     Legacy), so a queued T3 task sorts behind newer T2 arrivals for up to
+    ///     120ms, since nothing latency-critical is competing for the core
     ///   - T3 burst credit enabled (see tier_burst_cap_kns in imperator_bpf.c):
     ///     a simulation thread repeatedly preempted by background system work
     ///     earns slice extensions proportional to how often it was interrupted
@@ -607,9 +608,9 @@ impl<'a> Scheduler<'a> {
             //   core — enables SMT-aware hybrid placement steering.
             // core_thread_mask: bitmask of all SMT slots per physical core —
             //   denominator for fully-idle core detection.
-            // threads_per_ccd: logical CPU count of largest CCD — CCD-fill
-            //   threshold for work-stealing: don't steal from an LLC with fewer
-            //   queued tasks than it has CPU threads.
+            // threads_per_ccd: logical CPU count of largest CCD. No longer read
+            //   by the BPF side since the steal depth gate it fed was removed
+            //   (audit/G5-6); the rodata variable remains, so it is still set.
             for (i, &v) in topo.cpu_core_id.iter().enumerate().take(64) {
                 rodata.cpu_core_id[i] = v as u32;
             }
