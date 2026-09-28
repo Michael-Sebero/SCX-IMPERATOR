@@ -9,12 +9,12 @@
 char _license[] SEC("license") = "GPL";
 
 /* Scheduler RODATA config - JIT constant-folds these for ~200 cycle savings per decision */
-const u64 quantum_ns = CAKE_DEFAULT_QUANTUM_NS;
-const u64 new_flow_bonus_ns = CAKE_DEFAULT_NEW_FLOW_BONUS_NS;
-const bool enable_stats = false;
+const volatile u64 quantum_ns = CAKE_DEFAULT_QUANTUM_NS;
+const volatile u64 new_flow_bonus_ns = CAKE_DEFAULT_NEW_FLOW_BONUS_NS;
+const volatile bool enable_stats = false;
 
 /* Topology config - JIT eliminates unused P/E-core steering when has_hybrid=false */
-const bool has_hybrid = false;
+const volatile bool has_hybrid = false;
 
 /* Gap-4 / Suggestion 1: P-core bitmask for hybrid placement steering.
  *
@@ -40,7 +40,7 @@ const bool has_hybrid = false;
  * When big_cpu_mask=0 on a hybrid system: bit-test fails for all CPUs, the
  * early-out `!(big_cpu_mask & ...)` is false for cpu=0, but the BSF on 0
  * is guarded by `big_cpu_mask != 0` check — falls back cleanly. */
-const u64 big_cpu_mask = 0;
+const volatile u64 big_cpu_mask = 0;
 
 /* Suggestion 3: Sim profile mode — enables T3 burst credit in imperator_enqueue.
  * When false (all Gaming/Esports/Legacy/Default profiles): tier_burst_cap_kns[3] = 0,
@@ -59,15 +59,23 @@ const u64 big_cpu_mask = 0;
  * (well-predicted after the first tick) and the dual cap tables add 8 bytes of
  * RODATA — negligible on any profile.  Do not rely on JIT dead-stripping for
  * correctness; rely on it only for performance, and only as a best-effort bonus. */
-const bool sim_mode = false;
+const volatile bool sim_mode = false;
+
+/* audit/G5-8: every global the loader writes through rodata must be
+ * const volatile. A plain const global is an LLVM constant, so clang folds
+ * reads to the initializer and the loader's value never reaches the code:
+ * enable_stats=false compiled out all telemetry, nr_cpus=8 limited
+ * llc_cpu_mask to CPUs 0-7, nr_llcs=1 and cpu_llc_id={} compiled out
+ * per-LLC DSQs, and quantum_ns/new_flow_bonus_ns/has_hybrid/sim_mode and
+ * constant-index tier_configs reads ignored the profile. */
 
 /* Per-LLC DSQ partitioning — populated by loader from topology detection.
  * Eliminates cross-CCD lock contention: each LLC has its own DSQ.
  * Single-CCD (9800X3D): nr_llcs=1, identical to single-DSQ behavior.
  * Multi-CCD (9950X): nr_llcs=2, halves contention, eliminates cross-CCD atomics. */
-const u32 nr_llcs = 1;
-const u32 nr_cpus = 8;  /* Set by loader — bounds kick scan loop (Rule 39) */
-const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};
+const volatile u32 nr_llcs = 1;
+const volatile u32 nr_cpus = 8;  /* Set by loader — bounds kick scan loop (Rule 39) */
+const volatile u32 cpu_llc_id[CAKE_MAX_CPUS] = {};
 
 /* SMT and core topology RODATA — populated by loader from topology.rs.
  *
@@ -115,11 +123,11 @@ const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};
  * core_thread_mask" check described above would give these two arrays a
  * purpose again, but needs a live per-CPU occupancy signal this comment
  * isn't going to guess at — see that same comment for why. */
-const u32 cpu_core_id[CAKE_MAX_CPUS] = {};
-const u32 cpu_thread_bit[CAKE_MAX_CPUS] = {};
-const u64 core_cpu_mask[CAKE_MAX_CPUS] = {};
-const u32 core_thread_mask[CAKE_MAX_CPUS] = {};
-const u32 threads_per_ccd = 0;
+const volatile u32 cpu_core_id[CAKE_MAX_CPUS] = {};
+const volatile u32 cpu_thread_bit[CAKE_MAX_CPUS] = {};
+const volatile u64 core_cpu_mask[CAKE_MAX_CPUS] = {};
+const volatile u32 core_thread_mask[CAKE_MAX_CPUS] = {};
+const volatile u32 threads_per_ccd = 0;
 
 /* [A] llc_cpu_mask — BSS, computed by imperator_init from cpu_llc_id RODATA.
  *
@@ -270,7 +278,7 @@ UEI_DEFINE(uei);
 /* Tier config table - 4 tiers + padding, AoS layout: single cache line fetch
  * FIX (audit/F-03): PACK_CONFIG's budget_kns argument removed — see intf.h
  * for the full rationale for removing the wait-budget field entirely. */
-const fused_config_t tier_configs[8] = {
+const volatile fused_config_t tier_configs[8] = {
     /* T0: Critical (<100µs) — IRQ, input, audio */
     PACK_CONFIG(CAKE_DEFAULT_QUANTUM_NS >> 10, CAKE_DEFAULT_MULTIPLIER_T0,
                 CAKE_DEFAULT_STARVATION_T0 >> 10),
@@ -308,13 +316,26 @@ const fused_config_t tier_configs[8] = {
  * uniformly), so same-time arrivals keep strict tier order. A waiting task
  * overtakes newer higher-tier arrivals only after it has waited the budget
  * gap (Default: T1 6.5ms, T2 12ms, T3 80ms behind the next tier up). */
+#ifndef barrier_var
+#define barrier_var(var) asm volatile("" : "+r"(var))
+#endif
+
 static __always_inline u64 tier_deadline(u64 now, u8 tier, u64 advance)
 {
-    u8 t = CAKE_TIER_IDX(tier);
+    /* barrier_var() forces both index masks to be emitted. Without it clang
+     * proves t - 1 <= 2 from the t > 0 test and drops the mask, while the
+     * verifier tracks that test on a different register copy and rejects the
+     * load ("R5 unbounded memory access"). */
+    u32 t = tier;
+    barrier_var(t);
+    t = CAKE_TIER_IDX(t);
     u64 budget = UNPACK_STARVATION_NS(tier_configs[t]);
 
     if (advance && t > CAKE_TIER_CRITICAL) {
-        u64 above = UNPACK_STARVATION_NS(tier_configs[CAKE_TIER_IDX(t - 1)]);
+        u32 up = t - 1;
+        barrier_var(up);
+        up = CAKE_TIER_IDX(up);
+        u64 above = UNPACK_STARVATION_NS(tier_configs[up]);
         u64 gap = budget > above ? budget - above - 1 : 0;
         if (advance > gap)
             advance = gap;
