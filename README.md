@@ -50,7 +50,7 @@
 
 # Clone and build
 git clone https://github.com/Michael-Sebero/SCX-IMPERATOR
-cd SCX-IMPERATOR && cargo build --release
+cd SCX-IMPERATOR && sh build.sh
 
 # Install
 sudo install -m 755 target/release/scx_imperator /bin/scx_imperator
