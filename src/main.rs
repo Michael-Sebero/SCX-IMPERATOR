@@ -44,9 +44,9 @@ pub enum Profile {
     /// to <3 frame-times of starvation at 144Hz so background work (shader
     /// compilation, asset streaming, Discord, OBS, etc.) cannot visibly
     /// stutter the frame. Combined with full-clock DVFS on every tier (see
-    /// tier_perf_target[] in imperator_bpf.c) and lock-holder priority
-    /// boosting (lock_bpf.c) for Wine/Proton D3D submission threads, this
-    /// profile requires no additional configuration on a desktop PC.
+    /// tier_perf_target[] in imperator.bpf.c) and lock-holder protection
+    /// (lock.bpf.c, see --lock-boost) for futex-heavy Wine/Proton threads,
+    /// this profile requires no additional configuration on a desktop PC.
     #[value(alias = "gaming")]
     Default,
     /// Simulation / strategy game profile.
@@ -60,9 +60,6 @@ pub enum Profile {
     ///   - Looser starvation budgets: T3's deadline budget is 200ms (matches
     ///     Legacy), so a queued T3 task sorts behind newer T2 arrivals for up to
     ///     120ms, since nothing latency-critical is competing for the core
-    ///   - T3 burst credit enabled (see tier_burst_cap_kns in imperator_bpf.c):
-    ///     a simulation thread repeatedly preempted by background system work
-    ///     earns slice extensions proportional to how often it was interrupted
     ///   - T0/T1 thresholds are unchanged — audio and input remain protected
     ///
     /// FPS workloads running under this profile will behave correctly but
@@ -227,6 +224,110 @@ impl Profile {
     }
 }
 
+/// How lock-holder detection is hooked into the kernel (see lock.bpf.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LockBoost {
+    /// fexit probes if the kernel supports them, else syscall tracepoints.
+    Auto,
+    /// fexit probes on the in-kernel futex functions only.
+    Fexit,
+    /// syscalls:sys_{enter,exit}_futex* tracepoints only.
+    Tracepoint,
+    /// No lock-holder detection.
+    Off,
+}
+
+/// In-kernel futex functions the fexit probes attach to (all required).
+const FEXIT_FUTEX_TARGETS: [&str; 7] = [
+    "__futex_wait",
+    "futex_wait_multiple",
+    "futex_wait_requeue_pi",
+    "futex_lock_pi",
+    "futex_wake",
+    "futex_wake_op",
+    "futex_unlock_pi",
+];
+
+/// Which lock-probe program sets were enabled for loading.
+#[derive(Debug, Clone, Copy, Default)]
+struct LockProbePlan {
+    fexit: bool,
+    tracepoint: bool,
+}
+
+/// True when every name is a function symbol in /proc/kallsyms (one pass).
+fn all_in_kallsyms(names: &[&str]) -> bool {
+    use std::io::BufRead;
+    let Ok(f) = std::fs::File::open("/proc/kallsyms") else {
+        return false;
+    };
+    let mut found = vec![false; names.len()];
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        if let Some(sym) = line.split_whitespace().nth(2) {
+            if let Some(i) = names.iter().position(|n| *n == sym) {
+                found[i] = true;
+            }
+        }
+    }
+    found.iter().all(|&f| f)
+}
+
+/// The syscall tracepoint directory, whichever tracefs mount exposes it.
+fn syscall_events_dir() -> Option<std::path::PathBuf> {
+    ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+        .iter()
+        .map(|base| std::path::Path::new(base).join("events/syscalls"))
+        .find(|p| p.is_dir())
+}
+
+/// Enable (autoload) the lock-probe programs `mode` asks for and the kernel
+/// can take. Both sets may be loaded under `auto` so that run() can fall back
+/// to tracepoints if attaching the fexit probes fails. Called before load:
+/// a program whose target is missing would fail the whole skeleton load.
+fn enable_lock_probes(open_skel: &mut OpenBpfSkel, mode: LockBoost) -> LockProbePlan {
+    let mut plan = LockProbePlan::default();
+
+    if matches!(mode, LockBoost::Auto | LockBoost::Fexit) {
+        let in_btf = FEXIT_FUTEX_TARGETS
+            .iter()
+            .all(|f| scx_utils::compat::ksym_exists(f).unwrap_or(false));
+        if in_btf && all_in_kallsyms(&FEXIT_FUTEX_TARGETS) {
+            let p = &mut open_skel.progs;
+            p.imperator_fexit_futex_wait.set_autoload(true);
+            p.imperator_fexit_futex_wait_multiple.set_autoload(true);
+            p.imperator_fexit_futex_wait_requeue_pi.set_autoload(true);
+            p.imperator_fexit_futex_lock_pi.set_autoload(true);
+            p.imperator_fexit_futex_wake.set_autoload(true);
+            p.imperator_fexit_futex_wake_op.set_autoload(true);
+            p.imperator_fexit_futex_unlock_pi.set_autoload(true);
+            plan.fexit = true;
+        } else {
+            info!("Lock boost: futex functions not traceable on this kernel (missing BTF or symbols)");
+        }
+    }
+
+    if matches!(mode, LockBoost::Auto | LockBoost::Tracepoint) {
+        match syscall_events_dir() {
+            Some(dir) if dir.join("sys_enter_futex").is_dir() && dir.join("sys_exit_futex").is_dir() => {
+                let p = &mut open_skel.progs;
+                p.imperator_tp_enter_futex.set_autoload(true);
+                p.imperator_tp_exit_futex.set_autoload(true);
+                // futex2 syscalls (futex_waitv 5.16+, futex_wait/futex_wake 6.7+).
+                p.imperator_tp_exit_futex_waitv
+                    .set_autoload(dir.join("sys_exit_futex_waitv").is_dir());
+                p.imperator_tp_exit_futex_wait
+                    .set_autoload(dir.join("sys_exit_futex_wait").is_dir());
+                p.imperator_tp_exit_futex_wake
+                    .set_autoload(dir.join("sys_exit_futex_wake").is_dir());
+                plan.tracepoint = true;
+            }
+            _ => info!("Lock boost: futex syscall tracepoints not found (is tracefs mounted?)"),
+        }
+    }
+
+    plan
+}
+
 /// 🍰 scx_imperator: A sched_ext scheduler applying CAKE bufferbloat concepts
 ///
 /// DESKTOP PCs ONLY. `sudo scx_imperator` with no flags runs the desktop
@@ -259,8 +360,8 @@ struct Args {
     #[arg(long, short)]
     verbose: bool,
     /// FIX (audit/F-04): enable scheduler telemetry (BPF-side `enable_stats`
-    /// — tier dispatch counts, starvation preempts, dispatch-latency EWMA,
-    /// C3 burst-credit counters, etc.) without launching the interactive
+    /// — tier dispatch counts, tick preemptions, preemption kicks,
+    /// dispatch-latency EWMA, etc.) without launching the interactive
     /// TUI. For headless/systemd deployments: with this flag, a summary is
     /// logged periodically (see Scheduler::log_stats_summary) and the raw
     /// per-CPU counters remain readable via `bpftool map dump` on the
@@ -291,6 +392,19 @@ struct Args {
     /// entry either sweep would produce in that case.
     #[arg(long)]
     full_etd_sweep: bool,
+    /// Lock-holder protection: a task that just acquired a futex-based lock
+    /// is not chosen as a preemption victim and may run briefly past its
+    /// slice, and if it is preempted while holding the lock it is re-queued
+    /// slightly ahead of its tier (see lock.bpf.c). `auto` uses fexit probes
+    /// when the kernel allows and falls back to syscall tracepoints; `off`
+    /// disables detection entirely (useful for A/B comparisons).
+    #[arg(long, value_enum, default_value_t = LockBoost::Auto)]
+    lock_boost: LockBoost,
+    /// Disable the IRQ-wake boost (a wakeup issued from hardirq/softirq
+    /// context, including every timer expiry, sorts as T0 — T2 for bulk
+    /// tasks — for that dispatch). For A/B comparisons.
+    #[arg(long)]
+    no_irq_boost: bool,
 }
 
 impl Args {
@@ -312,6 +426,8 @@ struct Scheduler<'a> {
     /// eventfd read end: fires once when ETD calibration completes.
     /// -1 if creation failed (non-fatal: falls back to 60 s timeout polling).
     etd_efd: i32,
+    /// Lock-probe program sets loaded with the skeleton (attached in run()).
+    lock_plan: LockProbePlan,
 }
 
 impl Drop for Scheduler<'_> {
@@ -582,6 +698,7 @@ impl<'a> Scheduler<'a> {
             // Scheduler::log_stats_summary for the headless-visibility half
             // of this fix.
             rodata.enable_stats     = args.verbose || args.stats;
+            rodata.irq_boost        = !args.no_irq_boost;
             rodata.tier_configs     = args.profile.tier_configs(quantum, args.starvation);
             rodata.has_hybrid       = topo.has_hybrid_cores;
 
@@ -625,15 +742,6 @@ impl<'a> Scheduler<'a> {
             }
             rodata.threads_per_ccd  = topo.threads_per_ccd;
 
-            // Suggestion 3: sim_mode enables T3 burst credit in imperator_enqueue.
-            // In Default/Esports profiles, T3 burst credit is always 0 (T3 bulk
-            // work should not earn slice extensions when preempted by T0/T1).
-            // In Sim profile, T3 may be the dominant workload with nothing
-            // latency-critical competing — T3 burst credit lets a simulation
-            // thread earn recovery time when repeatedly preempted by background
-            // system work (kworkers, kswapd, etc.) rather than T0/T1 peers.
-            rodata.sim_mode         = matches!(args.profile, Profile::Sim);
-
             let llc_count = topo.llc_cpu_mask.iter().filter(|&&m| m != 0).count() as u32;
             rodata.nr_llcs = llc_count.max(1);
             rodata.nr_cpus = topo.nr_cpus.min(64) as u32;
@@ -647,9 +755,11 @@ impl<'a> Scheduler<'a> {
             // all-zeros, causing silent kick failures.
         }
 
+        let lock_plan = enable_lock_probes(&mut open_skel, args.lock_boost);
+
         let skel = open_skel.load().context("Failed to load BPF program")?;
 
-        Ok(Self { skel, args, topology: topo, latency_matrix, etd_efd })
+        Ok(Self { skel, args, topology: topo, latency_matrix, etd_efd, lock_plan })
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
@@ -660,17 +770,17 @@ impl<'a> Scheduler<'a> {
             .attach_struct_ops()
             .context("Failed to attach scheduler")?;
 
+        // Attached after the scheduler itself so the probes never run against
+        // a half-initialised scheduler; dropped (detached) when run() returns.
+        let _lock_links = self.attach_lock_probes();
+
         self.show_startup_splash()?;
 
         // FIX (audit/F-04): make telemetry status explicit rather than silent.
-        // Previously there was no way to tell, from the log alone, whether
-        // BPF stats collection was active — a headless run with stats off
-        // and a headless run with stats on looked identical until someone
-        // went looking at the BPF map directly.
         if self.args.verbose || self.args.stats {
             info!(
-                "Scheduler telemetry enabled (tier dispatches, starvation preempts, \
-                 dispatch-latency EWMA, C3 burst-credit counters)"
+                "Scheduler telemetry enabled (tier dispatches, tick preemptions, \
+                 preemption kicks, dispatch-latency EWMA)"
             );
         }
 
@@ -709,13 +819,19 @@ impl<'a> Scheduler<'a> {
                 ]
             };
 
+            // Gen 6: poll with a 1 s timeout so a BPF-side exit (watchdog,
+            // runtime error) is reported within a second rather than up to a
+            // minute later; the stats summary and ETD retry keep their ~60 s
+            // cadence.
+            let mut last_periodic = std::time::Instant::now();
+
             loop {
                 // Dynamic fd count: mirrors s6's `iopause_g(x, 2 + (notifyfd >= 0))`.
                 // After ETD fires (etd_written=true) or if the fd is unavailable,
                 // shrink to 1 — steady state polls only the signalfd.
                 let n_fds: usize = if etd_written || self.etd_efd < 0 { 1 } else { 2 };
 
-                let result = poll(&mut fds[..n_fds], nix::poll::PollTimeout::from(60_000u16));
+                let result = poll(&mut fds[..n_fds], nix::poll::PollTimeout::from(1_000u16));
 
                 match result {
                     Ok(n) if n > 0 => {
@@ -762,16 +878,17 @@ impl<'a> Scheduler<'a> {
                         }
                     }
                     Ok(_) => {
-                        // 60 s timeout: retry ETD write (covers eventfd-unavailable path),
-                        // log a periodic stats summary when telemetry is enabled without
-                        // the TUI (FIX audit/F-04 — piggybacks on this existing timeout
-                        // rather than introducing a second, separately-configurable
-                        // timer), and check for BPF scheduler exit via UEI.
-                        if !etd_written {
-                            etd_written = self.try_write_etd_costs();
-                        }
-                        if self.args.stats {
-                            self.log_stats_summary();
+                        // Every ~60 s: retry the ETD write (covers the
+                        // eventfd-unavailable path) and, with --stats, log a
+                        // telemetry summary (FIX audit/F-04).
+                        if last_periodic.elapsed() >= std::time::Duration::from_secs(60) {
+                            last_periodic = std::time::Instant::now();
+                            if !etd_written {
+                                etd_written = self.try_write_etd_costs();
+                            }
+                            if self.args.stats {
+                                self.log_stats_summary();
+                            }
                         }
                         if scx_utils::uei_exited!(&self.skel, uei) {
                             match scx_utils::uei_report!(&self.skel, uei) {
@@ -794,6 +911,59 @@ impl<'a> Scheduler<'a> {
 
         info!("scx_imperator scheduler shutting down");
         Ok(())
+    }
+
+    /// Attach the lock-probe programs enabled by enable_lock_probes():
+    /// fexit first, syscall tracepoints if that fails. All-or-nothing per set,
+    /// so a task is never flagged by a probe whose release probe is missing.
+    fn attach_lock_probes(&self) -> Vec<libbpf_rs::Link> {
+        let progs = &self.skel.progs;
+
+        if self.lock_plan.fexit {
+            let fexit = [
+                &progs.imperator_fexit_futex_wait,
+                &progs.imperator_fexit_futex_wait_multiple,
+                &progs.imperator_fexit_futex_wait_requeue_pi,
+                &progs.imperator_fexit_futex_lock_pi,
+                &progs.imperator_fexit_futex_wake,
+                &progs.imperator_fexit_futex_wake_op,
+                &progs.imperator_fexit_futex_unlock_pi,
+            ];
+            match fexit.iter().map(|p| p.attach()).collect::<Result<Vec<_>, _>>() {
+                Ok(links) => {
+                    info!("Lock boost: futex fexit probes attached");
+                    return links;
+                }
+                Err(e) => warn!("Lock boost: attaching fexit probes failed ({e})"),
+            }
+        }
+
+        if self.lock_plan.tracepoint {
+            let tps = [
+                &progs.imperator_tp_enter_futex,
+                &progs.imperator_tp_exit_futex,
+                &progs.imperator_tp_exit_futex_wait,
+                &progs.imperator_tp_exit_futex_waitv,
+                &progs.imperator_tp_exit_futex_wake,
+            ];
+            match tps
+                .iter()
+                .filter(|p| p.autoload())
+                .map(|p| p.attach())
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(links) => {
+                    info!("Lock boost: futex syscall tracepoints attached ({} programs)", links.len());
+                    return links;
+                }
+                Err(e) => warn!("Lock boost: attaching futex tracepoints failed ({e})"),
+            }
+        }
+
+        if self.args.lock_boost != LockBoost::Off {
+            warn!("Lock boost: no probe set could be attached; lock-holder protection is off");
+        }
+        Vec::new()
     }
 
     /// Compress the ETD matrix into per-LLC-pair costs and write to BPF BSS.
@@ -906,19 +1076,20 @@ impl<'a> Scheduler<'a> {
         };
 
         info!(
-            "scheduler stats: dispatches[new={} old={}] tier_dispatches={:?} \
-             starvation_preempts={:?} lock_holder_skips={} irq_wake_boosts={} \
-             waker_tier_boosts={} burst_credit[earned={} consumed={}] \
-             mean_dispatch_latency={}",
+            "scheduler stats: dispatches[wakeup={} requeue={}] tier_dispatches={:?} \
+             tick_preempts={:?} preempt_kicks={} prev_kept={} \
+             lock_holder_protects={} irq_wake_boosts={} waker_tier_boosts={} \
+             cadence_caps={} mean_dispatch_latency={}",
             stats.nr_new_flow_dispatches,
             stats.nr_old_flow_dispatches,
             stats.nr_tier_dispatches,
-            stats.nr_starvation_preempts_tier,
-            stats.nr_lock_holder_skips,
+            stats.nr_tick_preempts_tier,
+            stats.nr_preempt_kicks,
+            stats.nr_prev_kept,
+            stats.nr_lock_holder_protects,
             stats.nr_irq_wake_boosts,
             stats.nr_waker_tier_boosts,
-            stats.nr_preempt_with_credit,
-            stats.nr_burst_credit_consumed,
+            stats.nr_cadence_caps,
             mean_jitter,
         );
     }

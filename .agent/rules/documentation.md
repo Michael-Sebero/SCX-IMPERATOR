@@ -8,7 +8,7 @@ List of EBPF docs
 1. https://docs.ebpf.io/linux/kfuncs/scx_bpf_kick_cpu/
 2. https://docs.ebpf.io/linux/kfuncs/scx_bpf_select_cpu_dfl/
 3. https://docs.ebpf.io/linux/kfuncs/scx_bpf_select_cpu_and/
-4. https://docs.ebpf.io/linux/kfuncs/scx_bpf_cpu_rq/
+4. https://docs.ebpf.io/linux/kfuncs/scx_bpf_cpu_rq/ (deprecated: use scx_bpf_locked_rq / scx_bpf_cpu_curr)
 5. https://docs.ebpf.io/linux/kfuncs/scx_bpf_now/
 6. https://docs.ebpf.io/linux/kfuncs/scx_bpf_cpu_curr/
 7. https://docs.ebpf.io/linux/kfuncs/scx_bpf_locked_rq/

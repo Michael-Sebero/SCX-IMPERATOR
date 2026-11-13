@@ -43,20 +43,18 @@ pub fn aggregate_stats(skel: &BpfSkel) -> imperator_stats {
 
             for i in 0..crate::stats::TIER_NAMES.len() {
                 total.nr_tier_dispatches[i] += s.nr_tier_dispatches[i];
-                total.nr_starvation_preempts_tier[i] += s.nr_starvation_preempts_tier[i];
+                total.nr_tick_preempts_tier[i] += s.nr_tick_preempts_tier[i];
             }
 
-            // New LAVD-derived feature counters
-            total.nr_lock_holder_skips += s.nr_lock_holder_skips;
+            // LAVD-derived feature counters
+            total.nr_lock_holder_protects += s.nr_lock_holder_protects;
             total.nr_irq_wake_boosts += s.nr_irq_wake_boosts;
             total.nr_waker_tier_boosts += s.nr_waker_tier_boosts;
 
-            // C3: Burst credit counters — required for graduation gate evaluation.
-            // nr_preempt_with_credit counts T1/T2 preemptions that earned credit;
-            // nr_burst_credit_consumed counts dispatches that extended their slice.
-            // Both are per-CPU in BSS and must be summed here like every other field.
-            total.nr_preempt_with_credit   += s.nr_preempt_with_credit;
-            total.nr_burst_credit_consumed += s.nr_burst_credit_consumed;
+            // Gen 6 preemption / dispatch counters
+            total.nr_preempt_kicks    += s.nr_preempt_kicks;
+            total.nr_prev_kept        += s.nr_prev_kept;
+            total.nr_cadence_caps     += s.nr_cadence_caps;
 
             // W4 / C2-Infra: Sum dispatch latency aggregates so TUI can compute
             // mean dispatch latency across all CPUs without a BPF iterator.
@@ -82,15 +80,12 @@ pub struct TuiApp {
 /// Per-second event rates derived from two consecutive stats snapshots.
 /// Values are f64 so fractional rates display correctly at slow intervals.
 pub struct StatsRates {
-    /// Per-tier starvation preemptions per second.
-    pub starve_per_sec: [f64; 4],
-    /// Lock-holder starvation skips per second (system-wide).
-    pub lock_skip_per_sec: f64,
-    /// C3: T1/T2 preemptions earning burst credit per second.
-    /// Used alongside nr_starvation_preempts_tier[2] to evaluate the C3
-    /// graduation gate — a sustained non-zero rate confirms the credit
-    /// mechanism is actively firing during the test window.
-    pub burst_credit_per_sec: f64,
+    /// Per-tier tick preemptions (slice ran out with work queued) per second.
+    pub tick_preempt_per_sec: [f64; 4],
+    /// Lock-holder protections per second (system-wide).
+    pub lock_protect_per_sec: f64,
+    /// T0/T1 preemption kicks per second (system-wide).
+    pub kick_per_sec: f64,
 }
 
 impl TuiApp {
@@ -118,31 +113,24 @@ impl TuiApp {
             (cur.saturating_sub(prev)) as f64 / elapsed_secs
         };
 
-        let mut starve_per_sec = [0.0f64; 4];
+        let mut tick_preempt_per_sec = [0.0f64; 4];
         for i in 0..4 {
-            starve_per_sec[i] = delta(
-                current.nr_starvation_preempts_tier[i],
-                self.prev_stats.nr_starvation_preempts_tier[i],
+            tick_preempt_per_sec[i] = delta(
+                current.nr_tick_preempts_tier[i],
+                self.prev_stats.nr_tick_preempts_tier[i],
             );
         }
-        let lock_skip_per_sec = delta(
-            current.nr_lock_holder_skips,
-            self.prev_stats.nr_lock_holder_skips,
+        let lock_protect_per_sec = delta(
+            current.nr_lock_holder_protects,
+            self.prev_stats.nr_lock_holder_protects,
         );
-
-        // C3: Per-second rate of T1/T2 preemptions earning burst credit.
-        // Uses the same saturating-delta pattern as lock_skip_per_sec so
-        // counter resets via [r] produce zero rather than a wrap-around spike.
-        let burst_credit_per_sec = delta(
-            current.nr_preempt_with_credit,
-            self.prev_stats.nr_preempt_with_credit,
-        );
+        let kick_per_sec = delta(current.nr_preempt_kicks, self.prev_stats.nr_preempt_kicks);
 
         // Advance snapshot
         self.prev_stats = *current;
         self.prev_tick  = Instant::now();
 
-        StatsRates { starve_per_sec, lock_skip_per_sec, burst_credit_per_sec }
+        StatsRates { tick_preempt_per_sec, lock_protect_per_sec, kick_per_sec }
     }
 
     /// Invalidate the previous-stats snapshot so the next tick_stats() call
@@ -932,31 +920,28 @@ fn format_stats_for_clipboard(stats: &imperator_stats, uptime: &str) -> String {
         uptime
     ));
     output.push_str(&format!(
-        "Dispatches: {} total ({:.1}% new-flow)\n\n",
+        "Dispatches: {} total ({:.1}% wakeups, rest re-queues)\n\n",
         total_dispatches, new_pct
     ));
 
-    output.push_str("Tier           Dispatches    StarvTotal   (Starve/s is live-only)\n");
+    output.push_str("Tier           Dispatches   TickPreempt   (rates are live-only)\n");
     output.push_str("──────────────────────────────────────────────────────────────────\n");
     for (i, name) in TIER_NAMES.iter().enumerate() {
         output.push_str(&format!(
-            "{:12}   {:>10}    {:>12}\n",
-            name, stats.nr_tier_dispatches[i], stats.nr_starvation_preempts_tier[i]
+            "{:12}   {:>10}    {:>10}\n",
+            name, stats.nr_tier_dispatches[i], stats.nr_tick_preempts_tier[i]
         ));
     }
 
-    output.push_str("\nLAVD-derived feature counters:\n");
-    output.push_str(&format!("  Lock-holder starvation skips : {}\n", stats.nr_lock_holder_skips));
-    output.push_str(&format!("  IRQ-source wakeup T0 boosts  : {}\n", stats.nr_irq_wake_boosts));
-    output.push_str(&format!("  Waker tier inheritance boosts: {}\n", stats.nr_waker_tier_boosts));
+    output.push_str("\nPreemption and dispatch:\n");
+    output.push_str(&format!("  T0/T1 preemption kicks       : {}\n", stats.nr_preempt_kicks));
+    output.push_str(&format!("  Expiring tasks kept running  : {}\n", stats.nr_prev_kept));
+    output.push_str(&format!("  Frame-cadence T2 holds       : {}\n", stats.nr_cadence_caps));
 
-    // C3: Burst credit counters for graduation gate evaluation.
-    // The ratio consumed/credited is always ≈ 1.0 (credit earned and consumed
-    // in the same enqueue call); a value > 1.0 means prior accumulated credit
-    // was consumed alongside newly earned credit in a single dispatch.
-    output.push_str("\nC3 Burst credit counters:\n");
-    output.push_str(&format!("  Preemptions earning credit   : {}\n", stats.nr_preempt_with_credit));
-    output.push_str(&format!("  Dispatches consuming credit  : {}\n", stats.nr_burst_credit_consumed));
+    output.push_str("\nLAVD-derived feature counters:\n");
+    output.push_str(&format!("  Lock-holder protections      : {}\n", stats.nr_lock_holder_protects));
+    output.push_str(&format!("  IRQ-source wakeup boosts     : {}\n", stats.nr_irq_wake_boosts));
+    output.push_str(&format!("  Waker tier inheritance boosts: {}\n", stats.nr_waker_tier_boosts));
 
     // W4 / C2-Infra: Dispatch latency telemetry.
     // mean_jitter_us is the arithmetic mean of all per-task jitter_ewma_us
@@ -1039,12 +1024,9 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &imperator_stats, rates: &Sta
     frame.render_widget(header, layout[0]);
 
     // --- Stats Table ---
-    // FIX (gap/tui-rates): Added "Starve/s" column showing live per-tier starvation
-    // preemption rate.  This makes the starvation thresholds (3/8/40/100ms) observable
-    // in real time — a non-zero T0 Starve/s signals that audio/input tasks are being
-    // held past their threshold and the T0 gate should be tightened.  The cumulative
-    // "StarvTotal" column is preserved alongside it for session-level context.
-    let header_cells = ["Tier", "Dispatches", "StarvTotal", "Starve/s", "LockSkip", "IRQBoost", "WakerBoost"].iter().map(|h| {
+    // TickPreempt: imperator_tick ended a task's slice because it ran past
+    // next_slice while work was queued for its LLC (cumulative and per second).
+    let header_cells = ["Tier", "Dispatches", "TickPreempt", "Preempt/s", "LockProt", "IRQBoost", "WakerBoost"].iter().map(|h| {
         Cell::from(*h).style(
             Style::default()
                 .fg(Color::Yellow)
@@ -1057,29 +1039,26 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &imperator_stats, rates: &Sta
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            // Format Starve/s: show "—" when rate is zero (quiet) to avoid noise,
-            // and highlight non-zero T0/T1 rates in red since they indicate latency
-            // threshold breaches that may be perceptible to the user.
-            let starve_rate = rates.starve_per_sec[i];
-            let starve_rate_cell = if starve_rate < 0.05 {
+            // Show "—" when quiet; a T0/T1 task running past its slice with
+            // work queued is shown in red.
+            let rate = rates.tick_preempt_per_sec[i];
+            let rate_cell = if rate < 0.05 {
                 Cell::from("—").style(Style::default().fg(Color::DarkGray))
             } else if i <= 1 {
-                // T0/T1 breach — highlight red: these are the latency-sensitive tiers
-                Cell::from(format!("{:.1}/s", starve_rate))
+                Cell::from(format!("{:.1}/s", rate))
                     .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
             } else {
-                Cell::from(format!("{:.1}/s", starve_rate))
+                Cell::from(format!("{:.1}/s", rate))
                     .style(Style::default().fg(Color::Yellow))
             };
 
             let cells = vec![
                 Cell::from(*name).style(tier_style(i)),
                 Cell::from(format!("{}", stats.nr_tier_dispatches[i])),
-                Cell::from(format!("{}", stats.nr_starvation_preempts_tier[i])),
-                starve_rate_cell,
-                // Lock-holder skip and IRQ/waker boost counters are system-wide (not
-                // per-tier), so only show them on the T0 row to avoid duplication.
-                Cell::from(if i == 0 { format!("{}", stats.nr_lock_holder_skips) } else { String::new() }),
+                Cell::from(format!("{}", stats.nr_tick_preempts_tier[i])),
+                rate_cell,
+                // System-wide counters, shown once on the T0 row.
+                Cell::from(if i == 0 { format!("{}", stats.nr_lock_holder_protects) } else { String::new() }),
                 Cell::from(if i == 0 { format!("{}", stats.nr_irq_wake_boosts) } else { String::new() }),
                 Cell::from(if i == 0 { format!("{}", stats.nr_waker_tier_boosts) } else { String::new() }),
             ];
@@ -1109,41 +1088,23 @@ fn draw_ui(frame: &mut Frame, app: &TuiApp, stats: &imperator_stats, rates: &Sta
     frame.render_widget(table, layout[1]);
 
     // --- Summary ---
-    // Show lock_skip/s alongside total so the cap behaviour (Fix 2) is visible:
-    // persistent lock_skip/s > 0 after the cap fires indicates a task spending
-    // most of its time holding a futex — useful for diagnosing Wine/Proton stalls.
-    //
-    // C3: burst_credit_per_sec is the primary live signal for the graduation gate.
-    // Show "—" when zero (quiet) to match the lock_skip treatment; non-zero means
-    // T1/T2 preemptions are actively earning credit during this window.
-    let total_starvation: u64 = stats.nr_starvation_preempts_tier.iter().sum();
-    let lock_skip_rate_str = if rates.lock_skip_per_sec < 0.05 {
-        String::from("—")
-    } else {
-        format!("{:.1}/s", rates.lock_skip_per_sec)
-    };
-    let burst_credit_rate_str = if rates.burst_credit_per_sec < 0.05 {
-        String::from("—")
-    } else {
-        format!("{:.0}/s", rates.burst_credit_per_sec)
-    };
-    // W4 / C2-Infra: Compute mean dispatch latency from per-CPU aggregates.
-    // Shown as "—" until at least one DSQ-path dispatch has been measured so
-    // the display is not misleading at startup or on SYNC-only workloads.
+    let rate_str = |r: f64| if r < 0.05 { String::from("—") } else { format!("{:.0}/s", r) };
+    // Mean dispatch latency from the per-CPU aggregates; "—" until at least
+    // one queued wakeup has been measured.
     let mean_jitter_str = if stats.nr_jitter_ewma_count == 0 {
         String::from("—")
     } else {
         format!("{:.0}µs", stats.nr_jitter_ewma_sum as f64 / stats.nr_jitter_ewma_count as f64)
     };
     let summary_text = format!(
-        " Dispatches: {} | Starvation preempts: {} | Lock skips: {} ({}) | IRQ boosts: {} | Waker boosts: {} | Burst credit: {} | Dispatch latency: {}",
+        " Dispatches: {} | Kicks: {} ({}) | Kept running: {} | Lock protects: {} ({}) | Cadence holds: {} | Dispatch latency: {}",
         stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches,
-        total_starvation,
-        stats.nr_lock_holder_skips,
-        lock_skip_rate_str,
-        stats.nr_irq_wake_boosts,
-        stats.nr_waker_tier_boosts,
-        burst_credit_rate_str,
+        stats.nr_preempt_kicks,
+        rate_str(rates.kick_per_sec),
+        stats.nr_prev_kept,
+        stats.nr_lock_holder_protects,
+        rate_str(rates.lock_protect_per_sec),
+        stats.nr_cadence_caps,
         mean_jitter_str,
     );
 
@@ -1215,9 +1176,9 @@ pub fn run_tui(
     // W-4 fix: cache the most recently computed rates so sub-tick redraws
     // (triggered by key events) display the last valid values rather than zeros.
     let mut cached_rates = StatsRates {
-        starve_per_sec: [0.0; 4],
-        lock_skip_per_sec: 0.0,
-        burst_credit_per_sec: 0.0,
+        tick_preempt_per_sec: [0.0; 4],
+        lock_protect_per_sec: 0.0,
+        kick_per_sec: 0.0,
     };
 
     // Initialize clipboard (may fail on headless systems)
@@ -1283,7 +1244,7 @@ pub fn run_tui(
         // iterations triggered by early event::poll() returns (key events arriving
         // faster than interval_secs). This caused elapsed_secs in tick_stats() to
         // be measured against the previous loop iteration — potentially milliseconds
-        // — making all per-second rates (starve/s, lock_skip/s, burst_credit/s,
+        // — making all per-second rates (tick preempts/s, lock protects/s, kicks/s,
         // dispatch latency) erratic for as long as fast key input continued.
         //
         // Fix: move tick_stats() inside the tick-window guard so it fires at most

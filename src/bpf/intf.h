@@ -39,12 +39,28 @@ _Static_assert(CAKE_TIER_MAX <= 8,
  * referenced in BPF or Rust code.  Zero call sites confirmed by static analysis.
  * If a cross-LLC cost threshold is needed in future, reintroduce it here. */
 
-/* FLOW STATE FLAGS */
+/* FLOW STATE FLAGS — packed_info bits [27:24] */
 enum imperator_flow_flags {
-    CAKE_FLOW_NEW         = 1 << 0,
-    CAKE_FLAG_LOCK_HOLDER = 1 << 1,
-    CAKE_FLOW_IRQ_WAKE    = 1 << 2,
+    CAKE_FLOW_NEW         = 1 << 0,  /* DRR++ new-flow bonus still available */
+    CAKE_FLAG_LOCK_HOLDER = 1 << 1,  /* returned from a futex wait/lock this run */
+    CAKE_FLOW_IRQ_WAKE    = 1 << 2,  /* queued wakeup came from IRQ context */
 };
+
+/* EXTENDED FLAGS — packed_info bits [23:16] (Gen 6). One-shot, consumed by
+ * the next enqueue/dispatch; written with atomic OR/AND like the flow flags. */
+enum imperator_xflags {
+    CAKE_XF_YIELDED    = 1 << 0,  /* sched_yield(): do not keep running in dispatch */
+    CAKE_XF_LOCK_BOOST = 1 << 1,  /* preempted while holding a lock: deadline advance */
+};
+#define SHIFT_XFLAGS        16
+#define XFLAG(f)            ((u32)(f) << SHIFT_XFLAGS)
+#define FLOWFLAG(f)         ((u32)(f) << SHIFT_FLAGS)
+
+/* Frame-cadence cap (Gen 6, from LAVD's wait_freq signal): a task whose
+ * sleep-to-sleep period is at most this long, and that is idle for at least
+ * 1/8 of each period, is held at T2 instead of T3. 34ms ≈ 29.4Hz, so any
+ * thread paced at 30fps or faster qualifies. */
+#define FRAME_CADENCE_MAX_US  34000
 
 /* Per-task flow state — 64B, one cache line */
 struct imperator_task_ctx {
@@ -102,179 +118,65 @@ struct imperator_task_ctx {
      * original consecutive counter that fired at exactly 4).
      *
      * INIT VALUE: 0 (empty history, no overruns observed) — set explicitly
-     * by alloc_task_ctx_cold; also reset on exec in imperator_init_task.
+     * by alloc_task_ctx_cold.
      * FIELD NAME: kept as `overrun_count` to avoid disrupting external tools;
      *             the type (u8) and offset (byte 22) are unchanged.
-     * STRUCT SIZE: __pad has been reduced from [39] to [28] to accommodate the
-     *   C2-Infra fields (enqueue_time u32, jitter_ewma_us u16) and C3 field
-     *   (burst_credit u16) plus 3 bytes of explicit alignment padding.  The
-     *   struct remains exactly 64B; the _Static_assert below enforces this. */
+     * STRUCT SIZE: the struct is exactly 64B; the _Static_assert below
+     *   enforces this. */
     u8 overrun_count;
 
-    u8 lock_skip_count;
+    /* lock_grace: slice extensions granted to a running lock holder this
+     * run (0 or 1). Reset in imperator_stopping. */
+    u8 lock_grace;
 
-    /* pending_futex_op — tracepoint fallback op storage (lock_bpf.c).
-     *
+    /* pending_futex_op — tracepoint fallback op storage (lock.bpf.c).
      * Stores the futex op recorded at sys_enter_futex so sys_exit_futex can
-     * act on it even if the task migrated CPUs while sleeping (blocking futex
-     * variants park the task inside the kernel and may wake it on a different
-     * CPU from where it entered).
-     *
-     * INIT VALUE: CAKE_FUTEX_OP_UNSET (0xFF) — written explicitly by
-     * alloc_task_ctx_cold.  BPF task-storage zero-initialises new entries
-     * (giving 0 == CAKE_FUTEX_WAIT), which would cause a false set_lock_holder()
-     * on the first sys_exit_futex(ret=0) before any sys_enter_futex is observed.
-     * The explicit 0xFF init makes the UNSET guard in imperator_tp_exit_futex safe
-     * from the very first syscall. */
-    u8 pending_futex_op;  /* byte 24 */
+     * act on it even if the task migrated CPUs while sleeping. Initialised
+     * to CAKE_FUTEX_OP_UNSET (0xFF) because task storage is zero-filled and
+     * 0 == FUTEX_WAIT would read as a successful wait. */
+    u8 pending_futex_op;   /* byte 24 */
+    u8 __align_pad[3];     /* bytes 25-27 */
 
-    /* Explicit alignment pad [Bytes 25-27]
-     * enqueue_time is u32 and must be 4-byte aligned.  The three bytes between
-     * pending_futex_op (byte 24) and enqueue_time (byte 28) would be silently
-     * inserted by the compiler as implicit padding; we make them explicit so
-     * the _Static_assert below catches any future layout drift.  These bytes
-     * are unused and must be zero-initialized with the rest of the struct. */
-    u8 __align_pad[3];
+    /* Dispatch-latency telemetry [Bytes 28-33]
+     * enqueue_time: (u32)scx_bpf_now() at queued wakeup; consumed (zeroed)
+     *   in imperator_running, which turns it into one latency sample.
+     * jitter_ewma_us: α=1/8 EWMA of enqueue→running latency in ~µs (ns>>10). */
+    u32 enqueue_time;      /* bytes 28-31 */
+    u16 jitter_ewma_us;    /* bytes 32-33 */
 
-    /* C2-Infra: Scheduling latency telemetry [Bytes 28-33]
-     *
-     * enqueue_time: wall-clock timestamp (u32 ns, truncated from u64, wraps
-     *   ~4.3s) written at the start of imperator_enqueue for tasks taking the
-     *   standard wakeup/preempt path.  Read in imperator_running to compute
-     *   dispatch latency as (last_run_at - enqueue_time).  The subtraction is
-     *   safe within u32 for any dispatch latency < 4.3s, which covers all
-     *   realistic cases including runaway starvation.  Value 0 means "not yet
-     *   stamped via the timed path" and the jitter EWMA update is skipped.
-     *   Reset to 0 on exec (imperator_init_task !fork path) and fork.
-     *
-     * jitter_ewma_us: per-task EWMA of dispatch latency in approximate
-     *   microseconds (ns >> 10, same shift as runtime_us throughout the
-     *   codebase).  Uses α=1/8 (symmetric) — scheduling latency variance is
-     *   not directionally asymmetric in the way runtime is, so the asymmetric
-     *   α=1/4 promote / α=1/16 demote used by avg_runtime_us is not appropriate.
-     *   Clamped to u16 max (65ms).  Closes W1: first per-task scheduling
-     *   latency signal in the scheduler.  Reset to 0 on exec and fork.
-     *
-     * C3: DRR++ Burst Credit [Bytes 34-35]
-     *
-     * burst_credit: accumulated preemption-recovery credit in units of
-     *   (quantum_ns >> 10) — the same kns units used by deficit_us.  Credited
-     *   by (quantum_ns >> 12) kns (= quantum/4) each time this task is
-     *   re-enqueued via SCX_ENQ_PREEMPT while in tier T1 or T2, up to the
-     *   per-tier cap in tier_burst_cap_kns[].  T0 cap = T3 cap = 0: neither
-     *   critical tasks nor bulk tasks receive burst credit.
-     *
-     *   The credit is accumulated AND consumed within the same imperator_enqueue
-     *   invocation: the accumulation block runs first (adding to burst_credit),
-     *   then the consumption block reads it, extends the slice, and zeros it.
-     *   burst_credit is always 0 when imperator_enqueue returns — it does not
-     *   persist between enqueue calls.  A task that is preempted N consecutive
-     *   times will extend its slice by min(N × quantum/4, cap) on each
-     *   re-dispatch, providing proportional relief against repeated preemptions.
-     *
-     *   FIX (audit/Finding-4): Previous comment stated "set-on-preemption,
-     *   consumed-on-next-dispatch," which was inaccurate.  The correct lifecycle
-     *   is "accumulated and consumed within the same enqueue call."
-     *
-     *   FIX (audit/Finding-5): Previous cap values were {0, 2, 4, 0} in kns,
-     *   giving only ~2µs and ~4µs maximum bonus — too small to reduce
-     *   rescheduling frequency.  Corrected to {0, 2000, 4000, 0}, giving
-     *   T1: ~2ms max bonus (~1× quantum) and T2: ~4ms max bonus (~2× quantum).
-     *
-     *   FIX (audit/Finding-9): burst_credit is cleared in reclassify_task_cold
-     *   whenever the tier changes, preventing stale credit from a higher/lower
-     *   tier being consumed after the task has been reclassified.
-     *
-     *   Lifecycle: zeroed in alloc_task_ctx_cold, exec path of imperator_init_task,
-     *   fork path of imperator_init_task, and on every tier change in
-     *   reclassify_task_cold.  Always 0 after imperator_enqueue returns.
-     *
-     * Struct layout [Bytes 24-63]:
-     *   [24]     pending_futex_op  (u8)
-     *   [25-27]  __align_pad       (u8[3])   alignment gap before u32
-     *   [28-31]  enqueue_time      (u32)     C2-Infra: enqueue timestamp
-     *   [32-33]  jitter_ewma_us    (u16)     C2-Infra: dispatch latency EWMA
-     *   [34-35]  burst_credit      (u16)     C3: preemption burst credit
-     *   [36-39]  sleep_entry_time  (u32)     Gap-1: sleep-entry timestamp
-     *   [40-63]  __pad             (u8[24])  reserved, zero-initialized
-     *
-     * Total struct size: 64B — one cache line, _Static_assert enforces this. */
-    u32 enqueue_time;      /* bytes 28-31: C2-Infra enqueue timestamp */
-    u16 jitter_ewma_us;    /* bytes 32-33: C2-Infra dispatch latency EWMA */
-    u16 burst_credit;      /* bytes 34-35: C3 preemption burst credit */
+    /* cadence_us: α=1/4 EWMA of the sleep-to-sleep period in ~µs (ns>>10),
+     * saturating at 65535. 0 = no sample yet. Read by cadence_cap(). */
+    u16 cadence_us;        /* bytes 34-35 */
 
-    /* Gap-1 fix: Sleep-duration measurement for post-sleep recovery heuristic.
-     *
-     * PROBLEM (audit/Finding-6): the previous sleep-recovery heuristic in
-     * reclassify_task_cold measured (now - last_run_at) — bout duration, not
-     * sleep duration.  A task waking from a 30-second loading-screen sleep
-     * after a 5ms bout had runtime_raw=5ms and never triggered the 500ms
-     * threshold.  The heuristic almost never fired, regardless of actual sleep
-     * time, making it functionally inert.
-     *
-     * FIX: sleep_entry_time records the wall-clock timestamp (u32 nanoseconds,
-     * same truncation as last_run_at and enqueue_time) at the moment a task
-     * genuinely blocks — written in imperator_stopping when runnable=false,
-     * and left untouched from there.  It is read and consumed at the task's
-     * actual next wakeup, in imperator_enqueue (paired against the
-     * enqueue_time stamped there in the same call), to compute actual sleep
-     * duration:
-     *   sleep_duration = enqueue_time_at_wakeup - sleep_entry_time
-     *
-     * FIX (audit/F-01): earlier revisions of this comment (and the code)
-     * had reclassify_task_cold performing this read, gated on the `runnable`
-     * parameter imperator_stopping passed it.  That placement was itself
-     * buggy: reclassify_task_cold's only caller is imperator_stopping, which
-     * unconditionally (re)writes sleep_entry_time for the *current* stop
-     * event immediately before calling it — so the value read there was
-     * always "now," never a timestamp surviving from a prior sleep through
-     * an intervening wakeup, and enqueue_time was unconditionally 0 at that
-     * point (already consumed by imperator_running, or never set on the
-     * direct-dispatch path). The relocation to imperator_enqueue described
-     * above is the fix; reclassify_task_cold no longer takes a `runnable`
-     * parameter or touches this field at all.
-     *
-     * The subtraction is u32 wrap-safe for any sleep < 4.3 seconds, which
-     * covers all gaming and sim loading scenarios.  For sleeps > 4.3s the
-     * u32 subtraction wraps, producing an incorrect small value — the heuristic
-     * does not fire, which is the same as the previous behavior.  Acceptable:
-     * the heuristic is best-effort.
-     *
-     * LIFECYCLE:
-     *   alloc_task_ctx_cold  → sleep_entry_time = 0 (explicit zero)
-     *   imperator_stopping   → write (u32)scx_bpf_now() when !runnable
-     *                        → write 0 when runnable (clear stale value)
-     *   imperator_enqueue    → read and consume (compared against enqueue_time)
-     *   imperator_init_task  → reset to 0 on exec and fork
-     *
-     * SENTINEL: 0 means "no valid sleep entry timestamp" — the heuristic is
-     * skipped when sleep_entry_time == 0, matching the enqueue_time pattern.
-     *
-     * Struct layout [Bytes 36-63]:
-     *   [36-39]  sleep_entry_time  (u32)     ← Gap-1 fix
-     *   [40-41]  burst_acc_us      (u16)     ← audit/G5-2
-     *   [42-63]  __pad             (u8[22]) */
-    u32 sleep_entry_time;  /* bytes 36-39: sleep-entry timestamp for recovery heuristic */
+    /* sleep_entry_time: (u32)scx_bpf_now() when the task last blocked.
+     * Consumed by the post-sleep recovery check in imperator_enqueue. */
+    u32 sleep_entry_time;  /* bytes 36-39 */
 
-    /* audit/G5-2: CPU time (~µs, saturating at 65535) accumulated across
-     * preempted bouts since the task last slept. Written by
-     * reclassify_task_cold(); zeroed when the task blocks. */
+    /* burst_acc_us: CPU time (~µs, saturating) since the task last slept,
+     * summed across preempted bouts and kept-running segments. */
     u16 burst_acc_us;      /* bytes 40-41 */
-    u8  __pad[22];         /* bytes 42-63: reserved */
+    u16 __pad16;           /* bytes 42-43 */
+
+    /* last_sleep_at: (u32)scx_bpf_now() of the previous block; the delta to
+     * the next block is one cadence sample. Not consumed. */
+    u32 last_sleep_at;     /* bytes 44-47 */
+
+    u8  __pad[16];         /* bytes 48-63: reserved */
 } __attribute__((aligned(64)));
 
 _Static_assert(sizeof(struct imperator_task_ctx) == 64,
     "imperator_task_ctx must be exactly 64B (one cache line) — update __pad if fields change");
 
 /* packed_info bitfield layout:
- * [Stable:2][Tier:2][Flags:4][Rsvd:16]
- *  31-30     29-28   27-24    23-0
+ * [Stable:2][Tier:2][Flags:4][XFlags:8][Rsvd:16]
+ *  31-30     29-28   27-24    23-16     15-0
  *
  * Bits [15:0] previously held WAIT_DATA [15:8] and KALMAN_ERROR [7:0].
  * Both were written (KALMAN_ERROR initialised to 0xFF in alloc_task_ctx_cold)
  * but never read by any scheduling decision in imperator_bpf.c, lock_bpf.c,
  * or the Rust side.  Removed per W2 audit finding.  Bits [23:0] are now
- * reserved (Rsvd) and must be zero except for future use. */
+ * reserved (Rsvd) and must be zero except for future use. Gen 6 uses
+ * bits [23:16] for the one-shot extended flags (enum imperator_xflags). */
 #define SHIFT_FLAGS         24
 #define SHIFT_TIER          28
 #define SHIFT_STABLE        30
@@ -353,54 +255,48 @@ struct mega_mailbox_entry {
      * imperator_bpf.c for the full rationale. If T2 DVFS tuning is
      * revisited, update both this comment and the table in the same change. */
     u8 dsq_hint;
-    u8 tick_counter;
-    u8 __reserved[61];
+    u8 __rsvd8[2];
+    /* lock_since (Gen 6): (u32)scx_bpf_now() at which the task now running
+     * on this CPU returned from a futex wait/lock, 0 when it holds none.
+     * Written only by the owning CPU (lock probes, imperator_stopping); read
+     * by other CPUs choosing a preemption victim, which skip a CPU whose
+     * lock was acquired less than lock_window_ns ago. */
+    u32 lock_since;
+    u8 __reserved[56];
 } __attribute__((aligned(64)));
+_Static_assert(sizeof(struct mega_mailbox_entry) == 64,
+    "mega_mailbox_entry must be exactly 64B (one cache line)");
 
-/* Statistics */
+/* Statistics — per-CPU, summed by the loader (tui::aggregate_stats).
+ * Exactly 32 u64 = 256B so global_stats[] entries stay 256B-aligned. */
 struct imperator_stats {
-    u64 nr_new_flow_dispatches;
-    u64 nr_old_flow_dispatches;
+    u64 nr_new_flow_dispatches;   /* wakeup dispatches (idle path + queued wakeups) */
+    u64 nr_old_flow_dispatches;   /* re-queues: slice expiry, kicks, yields, new tasks */
     u64 nr_tier_dispatches[CAKE_TIER_MAX];
-    u64 nr_starvation_preempts_tier[CAKE_TIER_MAX];
-    u64 nr_lock_holder_skips;
+    /* nr_tick_preempts_tier: imperator_tick ended a task's slice because it
+     * ran past next_slice while work was queued for its LLC (was
+     * nr_starvation_preempts_tier, which could never fire). */
+    u64 nr_tick_preempts_tier[CAKE_TIER_MAX];
+    /* nr_lock_holder_protects: a running lock holder was spared — skipped as
+     * a preemption victim, or kept running past its slice once. */
+    u64 nr_lock_holder_protects;
     u64 nr_irq_wake_boosts;
     u64 nr_waker_tier_boosts;
-    /* C3: Burst credit accounting — informational, for TUI and graduation gate.
-     *
-     * nr_preempt_with_credit: incremented each time SCX_ENQ_PREEMPT credits
-     *   burst_credit to a T1/T2 task.  Tracks how often preemption recovery
-     *   fires, which is the expected mechanism for C3's jitter reduction.
-     *
-     * nr_burst_credit_consumed: incremented each time a task dispatches with
-     *   non-zero burst_credit and extends its slice.  Ratio of consumed/credited
-     *   shows whether earned credit is actually being used (tasks that earn credit
-     *   but are re-preempted before consuming it will show a gap). */
-    u64 nr_preempt_with_credit;
-    u64 nr_burst_credit_consumed;
-
-    /* C2-Infra: Dispatch latency telemetry aggregates — closes W4.
-     *
-     * jitter_ewma_us is per-task state in imperator_task_ctx and is not directly
-     * accessible from the TUI without a BPF iterator.  Instead, imperator_running
-     * accumulates two u64 aggregates here so the TUI can compute a system-wide
-     * mean dispatch latency without new BPF infrastructure:
-     *
-     *   mean_jitter_us = nr_jitter_ewma_sum / nr_jitter_ewma_count
-     *
-     * nr_jitter_ewma_sum: sum of jitter_ewma_us samples (in ~µs units) added
-     *   to each context switch where enqueue_time was non-zero (DSQ path only).
-     *   Per-CPU; summed in aggregate_stats() in tui.rs.
-     *
-     * nr_jitter_ewma_count: number of samples added.  Always incremented in
-     *   lockstep with nr_jitter_ewma_sum so the ratio is always valid.
-     *
-     * These fields overflow at ~18 × 10^18 samples (u64 max).  At 100K context
-     * switches/sec this takes ~5.8 million years — not a practical concern. */
+    /* nr_preempt_kicks: T0/T1 enqueues that kicked a T3/T2 victim CPU. */
+    u64 nr_preempt_kicks;
+    /* mean dispatch latency = nr_jitter_ewma_sum / nr_jitter_ewma_count */
     u64 nr_jitter_ewma_sum;
     u64 nr_jitter_ewma_count;
-    u64 _pad[15];
+    /* nr_prev_kept: ops.dispatch kept a task whose slice ended running
+     * because its deadline was earlier than the head of its LLC queue. */
+    u64 nr_prev_kept;
+    /* nr_cadence_caps: full reclassifications where the frame-cadence cap
+     * held a task at T2 that its burst length alone would have put in T3. */
+    u64 nr_cadence_caps;
+    u64 _pad[14];
 } __attribute__((aligned(64)));
+_Static_assert(sizeof(struct imperator_stats) == 256,
+    "imperator_stats must be exactly 256B — update _pad if fields change");
 
 /* Defaults (Gaming profile) */
 #define CAKE_DEFAULT_QUANTUM_NS         (2 * 1000 * 1000)

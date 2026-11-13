@@ -22,7 +22,7 @@
      * byte stores/loads on weakly-ordered architectures (ARM64).  Plain struct
      * member assignment is not guaranteed to be atomic or visible to other CPUs
      * without these wrappers, which is a data race under the C11 memory model.
-     * Used for mega_mailbox u8 fields (flags, dsq_hint, tick_counter) that are
+     * Used for mega_mailbox u8 fields (flags, dsq_hint) that are
      * written by the owning CPU in imperator_tick and read by other CPUs in imperator_enqueue
      * (waker-tier inheritance).  RELAXED semantics are sufficient here: no ordering
      * with respect to surrounding memory operations is required — visibility alone
@@ -143,32 +143,80 @@
     #define BIT_SCAN_FORWARD_U32(mask) __builtin_ctz(mask)
 #endif
 
-/* rq access — scx_bpf_cpu_rq() is universally available (~10-15ns).
- *
- * scx_bpf_rq_locked() would be ~3-5ns faster (skips RCU + bounds check) but
- * common.bpf.h declares it as strong __ksym — libbpf fails to load if the
- * kernel doesn't export it. A __weak redeclaration CANNOT override the strong
- * one already seen from common.bpf.h. Until the scx team makes it __weak or
- * all kernels export it, we use cpu_rq. */
-static __always_inline struct rq *imperator_get_rq(s32 cpu) {
-    return scx_bpf_cpu_rq(cpu);
-}
+/* rq access: the imperator_get_rq() wrapper around scx_bpf_cpu_rq() was
+ * removed in Gen 6. scx_bpf_cpu_rq() is deprecated upstream (use
+ * scx_bpf_locked_rq() for the rq the kernel already holds, or
+ * __COMPAT_scx_bpf_cpu_curr() for a remote CPU's current task), and its only
+ * caller was imperator_tick's unreachable Phase 2 starvation check. */
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * IRQ CONTEXT KFUNCS
+ * IRQ CONTEXT DETECTION (Gen 6 — from scx bpf_experimental.h, as used by LAVD)
  *
- * bpf_in_hardirq / bpf_in_nmi / bpf_in_serving_softirq are x86/arm64 kfuncs
- * introduced in Linux 6.x. Declared __weak so the scheduler loads cleanly on
- * kernels that do not export them — on those kernels the verifier substitutes
- * a zero return (false), which silently disables IRQ-wake boosting without
- * any code changes required. This mirrors the approach used by LAVD for the
- * same helpers.
+ * Up to Gen 5 this file declared bpf_in_hardirq/bpf_in_nmi/
+ * bpf_in_serving_softirq as __weak kfuncs. No mainline kernel exports kfuncs
+ * by those names — in the scx tree they are inline helpers reading the
+ * per-CPU preempt count — so the weak symbols resolved to NULL, every check
+ * read false, and the IRQ-wake boost only ever fired for wakeups issued by
+ * ksoftirqd.
  *
- * WITHOUT these declarations Clang 21 (strict -Wimplicit-function-declaration)
- * treats the call sites as undeclared identifiers and hard-errors the build.
+ * These read the preempt count directly: the per-CPU __preempt_count on
+ * x86 (6.15+), pcpu_hot.preempt_count between 6.1 and 6.14, and the task's
+ * thread_info on arm64. On PREEMPT_RT, softirqs run in task context and are
+ * tracked in task_struct::softirq_disable_cnt instead. Elsewhere they read 0
+ * (no boost), as before.
  * ═══════════════════════════════════════════════════════════════════════════ */
-extern bool bpf_in_hardirq(void) __ksym __weak;
-extern bool bpf_in_nmi(void) __ksym __weak;
-extern bool bpf_in_serving_softirq(void) __ksym __weak;
+#define IMP_SOFTIRQ_SHIFT   8
+#define IMP_HARDIRQ_SHIFT   16
+#define IMP_NMI_SHIFT       20
+#define IMP_SOFTIRQ_MASK    (0xffUL << IMP_SOFTIRQ_SHIFT)
+#define IMP_HARDIRQ_MASK    (0x0fUL << IMP_HARDIRQ_SHIFT)
+#define IMP_NMI_MASK        (0x0fUL << IMP_NMI_SHIFT)
+#define IMP_SOFTIRQ_OFFSET  (1UL << IMP_SOFTIRQ_SHIFT)
+
+extern bool CONFIG_PREEMPT_RT __kconfig __weak;
+
+#if defined(bpf_target_x86)
+extern const int __preempt_count __ksym __weak;
+
+struct pcpu_hot___imperator {
+    int preempt_count;
+} __attribute__((preserve_access_index));
+
+extern struct pcpu_hot___imperator pcpu_hot __ksym __weak;
+#endif
+
+struct task_struct___imperator_rt {
+    int softirq_disable_cnt;
+} __attribute__((preserve_access_index));
+
+static __always_inline int imperator_preempt_count(void)
+{
+#if defined(bpf_target_x86)
+    if (bpf_ksym_exists(&__preempt_count))
+        return *(int *)bpf_this_cpu_ptr(&__preempt_count);
+    if (bpf_core_field_exists(pcpu_hot.preempt_count))
+        return ((struct pcpu_hot___imperator *)bpf_this_cpu_ptr(&pcpu_hot))->preempt_count;
+#elif defined(bpf_target_arm64)
+    return bpf_get_current_task_btf()->thread_info.preempt.count;
+#endif
+    return 0;
+}
+
+/* Hard IRQ or NMI: device interrupts and, on non-RT kernels, every hrtimer
+ * expiry (nanosleep, futex/poll/epoll timeouts, timerfd). */
+static __always_inline bool imperator_in_hardirq_or_nmi(void)
+{
+    return imperator_preempt_count() & (IMP_HARDIRQ_MASK | IMP_NMI_MASK);
+}
+
+/* Serving a softirq (network RX, block completion, timer_list). */
+static __always_inline bool imperator_in_serving_softirq(void)
+{
+    if (!CONFIG_PREEMPT_RT)
+        return (imperator_preempt_count() & IMP_SOFTIRQ_MASK) & IMP_SOFTIRQ_OFFSET;
+
+    struct task_struct___imperator_rt *tsk = (void *)bpf_get_current_task_btf();
+    return (tsk->softirq_disable_cnt & IMP_SOFTIRQ_MASK) & IMP_SOFTIRQ_OFFSET;
+}
 
 #endif /* __CAKE_BPF_COMPAT_H */
